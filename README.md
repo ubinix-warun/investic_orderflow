@@ -54,7 +54,7 @@ python3 -m venv .venv
 source .venv/bin/activate        # Windows: .\.venv\Scripts\Activate.ps1
 
 # 3) ติดตั้งแพ็กเกจ
-pip install -r requirements.txt
+pip install -r requirement.txt
 
 
 เตรียมข้อมูล & สร้างแผนกริด
