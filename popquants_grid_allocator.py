@@ -28,48 +28,56 @@ def _round_price(p, tick):
         return p
     return np.round(np.round(p / tick) * tick, 8)
 
-def _zones_from_distance(levels: np.ndarray, spot: float, band_low: float,
+def _zones_from_distance(levels: np.ndarray, spot: float, band_low: float, band_high: float,
                          zone_near: float, zone_mid: float) -> List[str]:
-    # distance ratio from spot → band_low
-    denom = max(spot - band_low, 1e-12)
-    d = np.clip((spot - levels) / denom, 0.0, 1.0)
+    # distance ratio from spot → band_low (สำหรับฝั่งลง) และ spot → band_high (สำหรับฝั่งขึ้น)
+    denom_down = max(spot - band_low, 1e-12)
+    denom_up = max(band_high - spot, 1e-12)
+    
     zones = []
-    for di in d:
-        if di <= zone_near:
+    for level in levels:
+        if level <= spot:
+            # ฝั่งลง: ใช้ distance จาก spot → band_low
+            d = np.clip((spot - level) / denom_down, 0.0, 1.0)
+        else:
+            # ฝั่งขึ้น: ใช้ distance จาก spot → band_high
+            d = np.clip((level - spot) / denom_up, 0.0, 1.0)
+        
+        if d <= zone_near:
             zones.append("near")
-        elif di <= zone_mid:
+        elif d <= zone_mid:
             zones.append("mid")
         else:
             zones.append("far")
     return zones
 
-def _levels_equal_prob(spot: float, band_low: float, K: int,
+def _levels_equal_prob(spot: float, band_low: float, band_high: float, K: int,
                        mc_mins_samples: np.ndarray) -> np.ndarray:
     """
-    สร้างเลเวลฝั่งลงจำนวน K จุดจาก quantiles ของ 'ราคาต่ำสุดรายเส้นทาง'
-    แล้ว clip ให้อยู่ใน [band_low, spot], เรียงจากล่างขึ้นบน
+    สร้างเลเวลทั้งสองฝั่งจำนวน K จุดจาก quantiles ของ 'ราคาต่ำสุดรายเส้นทาง'
+    แล้ว clip ให้อยู่ใน [band_low, band_high], เรียงจากล่างขึ้นบน
     """
     mc_mins_samples = np.asarray(mc_mins_samples, dtype=float)
     if mc_mins_samples.size < 100:
         raise ValueError("mc_mins_samples is too small; need >=100 samples.")
-    # ใช้ quantiles สม่ำเสมอ แล้วตัดที่ <= spot
+    # ใช้ quantiles สม่ำเสมอ แล้วตัดที่ band_low <= x <= band_high
     qs = np.linspace(0.05, 0.95, K)  # คุณปรับได้
     raw = np.quantile(mc_mins_samples, qs)
-    raw = np.clip(raw, band_low, spot)
+    raw = np.clip(raw, band_low, band_high)  # เปลี่ยนจาก spot เป็น band_high
     levels = np.unique(np.sort(raw))
-    # ถ้าซ้ำ เยอะจนได้น้อยกว่า K ก็เติมแบบ linear ระหว่าง band_low→spot ให้ครบ
+    # ถ้าซ้ำ เยอะจนได้น้อยกว่า K ก็เติมแบบ linear ระหว่าง band_low→band_high ให้ครบ
     if levels.size < K:
-        lin = np.linspace(band_low, spot, K)
+        lin = np.linspace(band_low, band_high, K)  # เปลี่ยนจาก spot เป็น band_high
         mix = np.unique(np.sort(np.concatenate([levels, lin])))
-        # keep K ตัวท้าย (ใกล้ spot มากขึ้น) เพื่อให้จำนวนครบ
+        # keep K ตัวท้าย (ใกล้ band_high มากขึ้น) เพื่อให้จำนวนครบ
         if mix.size >= K:
             levels = mix[-K:]
         else:
             levels = mix
     return levels
 
-def _levels_equal_step(spot: float, band_low: float, K: int) -> np.ndarray:
-    levels = np.linspace(band_low, spot, K+1)[:-1]  # เว้น spot ไว้ให้เป็น near สูงสุด
+def _levels_equal_step(spot: float, band_low: float, band_high: float, K: int) -> np.ndarray:
+    levels = np.linspace(band_low, band_high, K)  # สร้าง grid ทั้งสองฝั่ง
     return levels
 
 def _make_weights(levels: np.ndarray, spot: float, band_low: float, budget_usd: float,
@@ -153,11 +161,11 @@ def build_grid(
     if method == "equal_prob":
         if mc_mins_samples is None:
             raise ValueError("mc_mins_samples must be provided for equal_prob method.")
-        levels = _levels_equal_prob(spot, band_low, K, mc_mins_samples)
+        levels = _levels_equal_prob(spot, band_low, band_high, K, mc_mins_samples)
     else:
-        levels = _levels_equal_step(spot, band_low, K)
+        levels = _levels_equal_step(spot, band_low, band_high, K)
 
-    zones = _zones_from_distance(levels, spot, band_low, zone_near, zone_mid)
+    zones = _zones_from_distance(levels, spot, band_low, band_high, zone_near, zone_mid)
 
     # สร้างน้ำหนัก “กลับด้านได้” ตาม weight_scheme
     weights = _make_weights(
@@ -178,7 +186,11 @@ def build_grid(
         size = usd_alloc / buy_p if buy_p > 0 else 0.0
         size = _round_qty(size, qty_step)
 
-        tp_price = _round_price(buy_p * (1.0 + tp_pct), price_tick)
+        # คำนวณ TP price: ฝั่งลงใช้ +tp_pct, ฝั่งขึ้นใช้ -tp_pct (ขายต่ำกว่าราคาซื้อ)
+        if lvl <= spot:
+            tp_price = _round_price(buy_p * (1.0 + tp_pct), price_tick)  # ฝั่งลง: ขายสูงกว่า
+        else:
+            tp_price = _round_price(buy_p * (1.0 - tp_pct), price_tick)  # ฝั่งขึ้น: ขายต่ำกว่า
 
         # ถ้า rounding ทำให้ไม่เหลือ size → ข้ามเลเวลนี้
         if size <= 0.0:
