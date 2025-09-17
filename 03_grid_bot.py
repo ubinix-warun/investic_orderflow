@@ -6,7 +6,7 @@ Live 5s bars + Signal + Grid Execution (Spot Binance, ccxt)
 - สัญญาณ: MAD-zscore (window=50), ยืนยัน 1 แท่ง
 - ซื้อเฉพาะเมื่อใกล้กริด ≤ GRID_TOL
 - กันเปิดซ้ำระดับ: pre-lock จาก open orders, ตรวจซ้ำก่อนยิง, map order→level
-- โหมดนี้: BUY = MARKET 100% แล้ววาง TP เป็น LIMIT SELL ทันที
+- โหมดนี้: BUY = MARKET 100% แล้ววาง TP เป็น LIMIT SELL ทันที (เวอร์ชันปลอดภัย: รอฟิลล์ + เช็ค balance ก่อน)
 """
 import csv
 import os
@@ -37,10 +37,10 @@ COOLDOWN_MS = 60_000        # คูลดาวน์หลังยิงค�
 
 # Threshold z-score ของสัญญาณทั้งสองตัว (ตั้งอิสระ)
 WINDOW = 50                 # ขนาดหน้าต่างข้อมูลย้อนหลังสำหรับคำนวณ MAD-zscore (หน่วย = จำนวนบาร์)
-CVD_Z_TH = 2              # เกณฑ์ z-score ของ CVD
+CVD_Z_TH = 2                # เกณฑ์ z-score ของ CVD
 TS_Z_TH  = 1.5              # เกณฑ์ z-score ของ Trade Size
 
-MAX_OPEN_ORDERS = 5         # จำกัดจำนวนดีลที่เปิดพร้อมกันสูงสุด (สำหรับการคุมความเสี่ยง)
+MAX_OPEN_ORDERS = 10        # จำกัดจำนวนดีลที่เปิดพร้อมกันสูงสุด (สำหรับการคุมความเสี่ยง)
 
 GRID_CSV = "grid_plan.csv"  # ไฟล์กริด: ต้องมี buy_price, coin_size, tp_price (หรือ tp_pct)
 GRID_RELOAD_SEC = 0         # รีโหลดไฟล์กริดอัตโนมัติทุก N วินาที (0 = ปิด)
@@ -49,6 +49,10 @@ DRY_RUN = False             # โหมด paper (ไม่ส่งออเด
 
 MIN_NOTIONAL_OVERRIDE = 5   # บังคับ notional ขั้นต่ำต่อคำสั่ง (USDT); ตั้ง None เพื่อใช้ค่าจากตลาด
 SLIP_PCT = 0.0007           # buffer สำหรับคำนวณจำนวนเหรียญขั้นต่ำให้ผ่าน notional จาก best_ask*(1+SLIP_PCT)
+
+# >>> เพิ่มค่าตั้งเพื่อความปลอดภัยในการวาง TP หลัง MARKET BUY <<<
+FILL_WAIT_SEC = 2.0         # เวลารอเช็คฟิลล์สูงสุด (วินาที)
+TP_DELAY_SEC  = 0.25        # หน่วงสั้น ๆ ก่อนส่ง TP (วินาที)
 
 # ชื่อไฟล์ log จะอิงจาก SYMBOL โดยอัตโนมัติ
 SYMBOL_SAFE = SYMBOL.replace("/", "").lower()
@@ -64,6 +68,16 @@ def ema_update(prev: Optional[float], x: float, span: int) -> float:
         return x
     alpha = 2.0 / (span + 1.0)
     return (1 - alpha) * prev + alpha * x
+
+def sf(x, nd=5) -> str:
+    """safe format: คืน 'nan' ถ้า x ไม่ใช่ตัวเลขปกติ"""
+    try:
+        v = float(x)
+        if not np.isfinite(v):
+            return "nan"
+        return f"{v:.{nd}f}"
+    except Exception:
+        return "nan"
 
 def load_grid_levels_from_csv(path: str) -> List[float]:
     try:
@@ -459,7 +473,7 @@ class ExecutionLayer:
             print(f"[ERR] market buy failed: {e}")
             return {"id": None, "filled": 0.0, "avg": None, "amt_sent": 0.0, "px_ref": px_ref}
 
-    # ---------- LIMIT SELL TP ----------
+    # ---------- LIMIT SELL TP (พื้นฐาน) ----------
     def place_limit_sell_tp(self, level: float, amount: float, tp_price: float) -> Optional[str]:
         px = self.round_price(tp_price)
         amt = self.round_amount_up(amount)
@@ -475,6 +489,81 @@ class ExecutionLayer:
         except Exception as e:
             print(f"[ERR] place TP failed @ {px}: {e}")
             return None
+
+    # ---------- helper: หาตัวย่อเหรียญ base / balance ----------
+    def _base_asset(self) -> str:
+        try:
+            return self.market.get("base") or self.symbol.split("/")[0]
+        except Exception:
+            return self.symbol.split("/")[0]
+
+    def _get_free_base(self) -> float:
+        try:
+            bal = self.ex.fetch_balance()
+            base = self._base_asset()
+            if "free" in bal and base in bal["free"]:
+                return float(bal["free"][base])
+            if base in bal and isinstance(bal[base], dict):
+                return float(bal[base].get("free", 0.0))
+        except Exception:
+            pass
+        return 0.0
+
+    def _wait_filled(self, order_id: str, timeout: float = FILL_WAIT_SEC) -> float:
+        """รอจนคำสั่ง market ถูกฟิลล์และ ccxt คืน filled > 0 (หรือหมดเวลา)"""
+        if not order_id:
+            return 0.0
+        end_ts = time.time() + max(0.0, timeout)
+        last_filled = 0.0
+        while time.time() < end_ts:
+            try:
+                o = self.ex.fetch_order(order_id, self.symbol)
+                last_filled = float(o.get("filled") or 0.0)
+                status = (o.get("status") or "").lower()
+                if last_filled > 0.0 or status in {"closed", "canceled"}:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return last_filled
+
+    def _safe_tp_amount(self, desired_amt: float, tp_price: float) -> float:
+        """ปัดจำนวนลงตาม LOT_SIZE และบังคับผ่าน minQty/minNotional"""
+        amt = max(0.0, float(desired_amt))
+        if amt <= 0:
+            return 0.0
+        step = self.step_size or 1e-12
+        amt = math.floor(amt / step) * step  # ปัดลง
+        if self.min_qty and amt < self.min_qty:
+            return 0.0
+        if self.min_notional and (amt * tp_price < self.min_notional):
+            return 0.0
+        return amt
+
+    def place_tp_after_market(self, level: float, market_order_id: Optional[str],
+                              desired_amt: float, tp_price: float) -> Optional[str]:
+        """
+        วาง TP แบบปลอดภัย: (1) รอผล filled ของคำสั่งตลาด, (2) หน่วงให้ balance sync,
+        (3) อ่าน free base, (4) คำนวณจำนวนขายที่ปลอดภัยและปัดตาม LOT/MIN_NOTIONAL
+        """
+        if self.dry:
+            print(f"[DRY] place TP after market: tp_price={tp_price}")
+            return f"dry-tp-{level}"
+
+        filled_from_order = self._wait_filled(market_order_id, FILL_WAIT_SEC) if market_order_id else 0.0
+        time.sleep(max(0.0, TP_DELAY_SEC))
+        free_base = self._get_free_base()
+
+        sell_raw = min(max(desired_amt, 0.0),
+                       filled_from_order if filled_from_order > 0 else free_base,
+                       free_base)
+
+        sell_amt = self._safe_tp_amount(sell_raw, tp_price)
+        if sell_amt <= 0:
+            print(f"[skip] TP not placed (sell_amt={sell_amt} | free={free_base} | filled={filled_from_order})")
+            return None
+
+        return self.place_limit_sell_tp(level, sell_amt, tp_price)
 
     # ---------- pre-lock existing open orders ----------
     def level_key_from_price(self, grid_df: pd.DataFrame, px: float) -> float:
@@ -571,70 +660,89 @@ def main() -> None:
         aggr.add_trades(tr)
 
         bar = aggr.roll_bar(now_ms())
-        if bar:
-            decision = engine.update(bar, now_ms(), MAX_OPEN_ORDERS)
+        if not bar:
+            time.sleep(0.01)
+            continue
 
-            ts_str = datetime.fromtimestamp(bar["bar_ts"]/1000, tz=timezone.utc).strftime("%H:%M:%S")
-            dq = bar.get("data_quality", "n/a")
-            print(
-                f"[{ts_str}] mid={decision['mid_price_5s']:.5f}  "
-                f"cvd_z={decision['cvd_z']:.2f}  ts_z={decision['trade_size_z']:.2f}  "
-                f"conf={decision['confirm_count']}  grid={decision['grid_candidate']}  "
-                f"act={decision['action']}  dq={dq}  bars={engine.bars_total}  "
-                f"active_lv={len(engine.active_levels)}"
-            )
+        ts_str = datetime.fromtimestamp(bar["bar_ts"]/1000, tz=timezone.utc).strftime("%H:%M:%S")
+        dq = bar.get("data_quality", "n/a")
 
-            # --- เขียน CSV ---
+        # ถ้าบาร์ไม่พร้อม (ไม่มี mid/depth ครบ) ให้ข้ามเพื่อลด error formatting
+        if not bar.get("ok", False):
+            print(f"[{ts_str}] dq={dq} (skip partial/stale bar)")
             if csv_wr:
-                bar_dt = datetime.fromtimestamp(bar["bar_ts"]/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 csv_wr.writerow([
                     int(bar["bar_ts"]),
-                    bar_dt,
-                    dq,
-                    decision.get("mid_price_5s"),
-                    decision.get("cvd"),
-                    decision.get("cvd_z"),
-                    decision.get("trade_size_buy_5s"),
-                    decision.get("trade_size_z"),
-                    decision.get("confirm_count"),
-                    decision.get("buy_signal_raw"),
-                    decision.get("buy_signal_confirmed"),
-                    decision.get("grid_candidate"),
-                    decision.get("action"),
-                    decision.get("reason"),
-                    engine.bars_total,
-                    len(engine.active_levels),
+                    datetime.fromtimestamp(bar["bar_ts"]/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                    dq, None, None, None, None, None, None, None, None, None, "SKIP_PARTIAL", "",
+                    engine.bars_total, len(engine.active_levels)
                 ])
                 csv_fh.flush()
+            continue
 
-            # --- Execution ---
-            if decision["action"] == "PLACE_BUY" and decision["grid_candidate"] is not None:
-                level = float(decision["grid_candidate"])
+        # ---- คำนวณสัญญาณเฉพาะบาร์ที่ ok ----
+        decision = engine.update(bar, now_ms(), MAX_OPEN_ORDERS)
 
-                if level in engine.active_levels:
-                    print(f"[skip] level {level} already locked.")
+        print(
+            f"[{ts_str}] mid={sf(decision['mid_price_5s'])}  "
+            f"cvd_z={sf(decision['cvd_z'],2)}  ts_z={sf(decision['trade_size_z'],2)}  "
+            f"conf={decision['confirm_count']}  grid={sf(decision['grid_candidate'])}  "
+            f"act={decision['action']}  dq={dq}  bars={engine.bars_total}  "
+            f"active_lv={len(engine.active_levels)}"
+        )
+
+        # --- เขียน CSV ---
+        if csv_wr:
+            bar_dt = datetime.fromtimestamp(bar["bar_ts"]/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            csv_wr.writerow([
+                int(bar["bar_ts"]), bar_dt, dq,
+                decision.get("mid_price_5s"),
+                decision.get("cvd"),
+                decision.get("cvd_z"),
+                decision.get("trade_size_buy_5s"),
+                decision.get("trade_size_z"),
+                decision.get("confirm_count"),
+                decision.get("buy_signal_raw"),
+                decision.get("buy_signal_confirmed"),
+                decision.get("grid_candidate"),
+                decision.get("action"),
+                decision.get("reason"),
+                engine.bars_total,
+                len(engine.active_levels),
+            ])
+            csv_fh.flush()
+
+        # --- Execution ---
+        if decision["action"] == "PLACE_BUY" and decision["grid_candidate"] is not None:
+            level = float(decision["grid_candidate"])
+
+            if level in engine.active_levels:
+                print(f"[skip] level {level} already locked.")
+            else:
+                # ล็อกเลเวลก่อน (กันสัญญาณรัว ๆ)
+                engine.on_order_placed(now_ms(), level)
+
+                # ซื้อด้วย MARKET 100%
+                row = match_grid_row(grid_df, level)
+                coin_size = float(row["coin_size"])
+                res = execu.place_market_buy(level, coin_size)
+                market_id = res.get("id")
+                filled_amt = res["filled"] if res["filled"] > 0 else coin_size
+
+                if res["id"] or DRY_RUN:
+                    # นับเป็นฟิลแล้ว (market) → เพิ่ม open_orders_count
+                    engine.on_order_filled(now_ms(), level)
+                    tp_px = float(row["tp_price"])
+
+                    # วาง TP แบบปลอดภัย: รอฟิลล์ + เช็ค balance ก่อน
+                    tp_id = execu.place_tp_after_market(level, market_id, filled_amt, tp_px)
+                    if tp_id:
+                        execu.tp_ids[level] = tp_id
                 else:
-                    # ล็อกเลเวลก่อน (กันสัญญาณรัว ๆ รอบติดกัน)
-                    engine.on_order_placed(now_ms(), level)
+                    # ซื้อไม่สำเร็จ → ปลดล็อกเลเวล
+                    engine.active_levels.discard(level)
 
-                    # ซื้อด้วย MARKET 100%
-                    row = match_grid_row(grid_df, level)
-                    coin_size = float(row["coin_size"])
-                    res = execu.place_market_buy(level, coin_size)
-                    filled_amt = res["filled"] if res["filled"] > 0 else coin_size
-
-                    if res["id"] or DRY_RUN:
-                        # นับเป็นฟิลแล้ว (market) → เพิ่ม open_orders_count และวาง TP ทันที
-                        engine.on_order_filled(now_ms(), level)
-                        tp_px = float(row["tp_price"])
-                        tp_id = execu.place_limit_sell_tp(level, filled_amt, tp_px)
-                        if tp_id:
-                            execu.tp_ids[level] = tp_id
-                    else:
-                        # ถ้าซื้อไม่สำเร็จ ให้ปลดล็อกเลเวลคืน
-                        engine.active_levels.discard(level)
-
-            execu.poll(engine, grid_df)
+        execu.poll(engine, grid_df)
 
         elapsed = now_ms() - t0
         time.sleep(max(0.0, 1.0 - elapsed/1000.0))
