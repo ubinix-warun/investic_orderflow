@@ -24,6 +24,7 @@
 ---
 
 ## สถาปัตยกรรมโดยสรุป
+```
 Monte Carlo (macro_montecarlo.csv)
 │
 ├─> Grid Allocator → grid_plan.csv (buy_price, coin_size, tp_price)
@@ -37,7 +38,7 @@ Logic check: signal_confirmed + cooldown + under_limits + level_free
 BUY = MARKET (taker 100%) → ตั้ง LIMIT TP ทันที
 │
 Log → logs/<symbol>_5s_decisions.csv
-
+```
 
 
 ---
