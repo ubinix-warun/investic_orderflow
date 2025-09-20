@@ -1,73 +1,59 @@
-# run_macro_and_build_grid.py
-"""
-Pipeline: Monte Carlo (AUTO) -> Grid Plan (AUTO)
-- ดึง OHLCV 1D จาก Binance + retry/backoff
-- Block-bootstrap Monte Carlo บน log-returns
-- คำนวณ band จาก percentiles ของ min/max ราคาในอนาคต
-- AUTO:
-    * lower_level  = floor_to_tick(band_low)
-    * upper_level  = ceil_to_tick(band_high)
-    * grid_min_step = PRICE_TICK จาก Binance
-    * max_layers    = clamp(floor((upper-lower)/step), [MIN_LAYERS_FLOOR, MAX_LAYERS_CAP])
-- เขียน macro_montecarlo.csv (path-level + summary 1 แถว)
-- วางกริดแบบ split โดยอิงงบ/ขั้นต่ำตลาด ณ “จุดไกลสุด” ของแต่ละฝั่ง
-- เขียน grid_plan.csv
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-ติดตั้ง: pip install ccxt pandas numpy
+"""
+Grid Planner (Single-Panel, Monotone Down with Price)
+- แผงเดียว: ไม่แบ่ง below/above ในการจัดงบ
+- เงินต่อกริด: ราคาต่ำสุดใช้เงินมากสุด แล้ว "ลดลงเรื่อย ๆ" จนถึงราคาสูงสุด
+- เคารพขั้นต่ำตลาดจริง (minNotional/minQty), PRICE_TICK, LOT_SIZE
+- Binary search หาความชัน (slope) หลังปัด LOT/ขั้นต่ำ ให้รวม ≈ งบ
+- ถ้างบยังไม่พอขั้นต่ำทุกชั้น → ตัดชั้น "ด้านบนสุด" ออกก่อน (คงด้านล่างไว้)
 """
 
-import os
-import re
-import time
-import math
+import os, re, time, math
 import numpy as np
 import pandas as pd
 import ccxt
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, Tuple, Optional
+from typing import Optional, Tuple
 
-# ====== USER CONFIG ======
+# ============== USER CONFIG ==============
 CFG = {
-    # ---- Market / MC ----
     "symbol": "XRP/USDT",
     "timeframe": "1d",
     "lookback_bars": 1000,
     "paths": 10_000,
     "horizon_bars": 60,
     "block_len": 24,
-    "band_percentiles": (10, 90),      # p10 of path MIN, p90 of path MAX
-    "MAX_LAYERS_CAP": 200,
-    "MIN_LAYERS_FLOOR": 10,
+    "band_percentiles": (10, 90),
     "http_timeout_ms": 30000,
     "http_retries": 5,
     "retry_backoff_base_sec": 1.0,
 
-    # ---- Grid planner (split) ----
-    "GRID_MODE": "split",              # "split" | "symmetric"
-    "LEVELS_LOWER_WEIGHT": 50,
-    "BUDGET_LOWER_WEIGHT": None,       # None = ใช้ค่าเดียวกับ LEVELS_LOOWER_WEIGHT
-    "MIN_SIDE_LEVELS": 1,
-    "LOWER_STRETCH_PCT": 15.0,
-    "BUDGET_USD": 300.0,               # ค่าเริ่มต้นเงินต้น (จะถามผู้ใช้ตอนรัน)
-    "FEE_RATE": 0.0004,
-    "TP_PCT": 0.01,                    # ค่าดีฟอลต์ 1% (จะถามผู้ใช้ตอนรัน)
+    # กรอบเลเวล
+    "LOWER_STRETCH_PCT": 15.0,     # ยืดกรอบฝั่งล่างให้หย่อนลง
+    "MAX_LAYERS_CAP": 200,         # เพดานทฤษฎี
+    "LEVELS_CAP": 0,               # จำกัดจำนวนชั้นจริงทั้งแผง (0=ไม่จำกัด)
+
+    # งบ/TP/ค่าธรรมเนียม
+    "BUDGET_USD": 300.0,
+    "TP_PCT": 0.01,                # 1% = 0.01
+    "FEE_RATE": 0.0004,            # ต่อข้าง
+
+    # ช่วยตั้งจำนวนชั้นคร่าว ๆ: เป้าต่อชั้นใกล้ ๆ = target_mult × minNotional
+    "TARGET_MIN_MULTIPLIER": 2.0,  # 2 เท่าของขั้นต่ำตลาดต่อแถว
+
+    # labels (รายงานผล)
     "ZONE_NEAR": 0.05,
     "ZONE_MID": 0.15,
-    "WEIGHT_SCHEME": "far_heavier",
-    "ENFORCE_MIN_NOTIONAL": True,
-    "DROP_POLICY": "farthest",         # "farthest" | "smallest"
 
-    # ---- Outputs ----
+    # outputs
     "macro_csv": "macro_montecarlo.csv",
     "grid_csv": "grid_plan.csv",
 }
 
-# ====== External dependency for allocation ======
-from popquants_grid_allocator import build_grid
-
-
-# ====== Retry helper ======
+# ============== Retry helper ==============
 def _with_retries(fn, retries: int, backoff_base: float, *args, **kwargs):
     last_exc = None
     for i in range(retries):
@@ -84,8 +70,7 @@ def _with_retries(fn, retries: int, backoff_base: float, *args, **kwargs):
         raise last_exc
     raise RuntimeError("Unknown error in _with_retries")
 
-
-# ====== Binance client (reuse one instance) ======
+# ============== CCXT client ==============
 class BinanceClient:
     def __init__(self, timeout_ms: int):
         self.ex = ccxt.binance({
@@ -100,35 +85,30 @@ class BinanceClient:
 
     def market(self, symbol: str):
         if self.markets is None:
-            raise RuntimeError("markets not loaded; call load_markets() first")
+            raise RuntimeError("markets not loaded")
         return self.ex.market(symbol)
 
     def fetch_ohlcv_1d(self, symbol: str, lookback_bars: int, retries: int, backoff: float) -> pd.DataFrame:
         raw = _with_retries(self.ex.fetch_ohlcv, retries, backoff, symbol=symbol, timeframe="1d", limit=lookback_bars)
         if not raw or len(raw) < 50:
-            raise RuntimeError("Not enough OHLCV returned.")
+            raise RuntimeError("Not enough OHLCV data.")
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("Asia/Bangkok")
         return df[["dt", "open", "high", "low", "close", "volume"]]
 
-
+# ============== Market meta ==============
 def _extract_meta_from_market(m: dict) -> Tuple[Optional[float], Optional[float], float, float]:
-    """Return (min_notional, min_qty, price_tick, qty_step)"""
-    # price_tick / qty_step
+    """(min_notional, min_qty, price_tick, qty_step) — ดึงจาก exchange จริง"""
     tick_size, qty_step = None, None
     filters = (m.get("info", {}) or {}).get("filters", []) or []
     for f in filters:
         t = f.get("filterType")
         if t == "PRICE_FILTER":
-            try:
-                tick_size = float(f.get("tickSize", "0.0001"))
-            except Exception:
-                pass
+            try: tick_size = float(f.get("tickSize", "0.0001"))
+            except: pass
         if t == "LOT_SIZE":
-            try:
-                qty_step = float(f.get("stepSize", "0.0001"))
-            except Exception:
-                pass
+            try: qty_step = float(f.get("stepSize", "0.0001"))
+            except: pass
     if tick_size is None:
         pr = (m.get("precision", {}) or {}).get("price", 4)
         tick_size = 10 ** (-int(pr))
@@ -136,69 +116,53 @@ def _extract_meta_from_market(m: dict) -> Tuple[Optional[float], Optional[float]
         pr = (m.get("precision", {}) or {}).get("amount", 4)
         qty_step = 10 ** (-int(pr))
 
-    # min_notional / min_qty
     min_notional, min_qty = None, None
     limits = m.get("limits", {}) or {}
     cost = limits.get("cost", {}) or {}
-    amt = limits.get("amount", {}) or {}
+    amt  = limits.get("amount", {}) or {}
     try:
-        if cost.get("min") is not None:
-            min_notional = float(cost["min"])
-    except Exception:
-        pass
+        if cost.get("min") is not None: min_notional = float(cost["min"])
+    except: pass
     try:
-        if amt.get("min") is not None:
-            min_qty = float(amt["min"])
-    except Exception:
-        pass
+        if amt.get("min") is not None: min_qty = float(amt["min"])
+    except: pass
 
-    if min_notional is None or min_qty is None:
+    if (min_notional is None) or (min_qty is None):
         for f in filters:
             t = f.get("filterType")
             if (t in ("MIN_NOTIONAL", "NOTIONAL")) and (min_notional is None):
                 raw = f.get("minNotional") or f.get("notional")
                 try:
-                    if raw is not None:
-                        min_notional = float(raw)
-                except Exception:
-                    pass
+                    if raw is not None: min_notional = float(raw)
+                except: pass
             if t == "LOT_SIZE" and (min_qty is None):
                 raw = f.get("minQty")
                 try:
-                    if raw is not None:
-                        min_qty = float(raw)
-                except Exception:
-                    pass
+                    if raw is not None: min_qty = float(raw)
+                except: pass
 
-    return (float(min_notional) if min_notional is not None else None,
-            float(min_qty) if min_qty is not None else None,
-            float(tick_size), float(qty_step))
+    return (min_notional, min_qty, float(tick_size), float(qty_step))
 
-
-# ====== MC core ======
+# ============== MC core ==============
 def block_bootstrap_returns(ret: np.ndarray, horizon: int, block_len: int, paths: int, rng: np.random.Generator):
     n = len(ret)
     if n < block_len + 5:
-        raise ValueError("Return history too short for chosen block_len.")
+        raise ValueError("Return history too short.")
     out = np.empty((paths, horizon), dtype=float)
-    valid_starts = np.arange(0, n - block_len + 1)
+    valid = np.arange(0, n - block_len + 1)
     for p in range(paths):
         seg = []
         while len(seg) < horizon:
-            start = rng.choice(valid_starts)
+            start = rng.choice(valid)
             seg.extend(ret[start:start+block_len])
         out[p, :] = np.array(seg[:horizon])
     return out
 
-
 def simulate_price_paths(spot: float, logret_paths: np.ndarray) -> np.ndarray:
-    cum = np.cumsum(logret_paths, axis=1)
-    return spot * np.exp(cum)
-
+    return spot * np.exp(np.cumsum(logret_paths, axis=1))
 
 def summarize_macro(prices: np.ndarray, spot: float, p_lo=10, p_hi=90):
-    path_min = prices.min(axis=1)
-    path_max = prices.max(axis=1)
+    path_min = prices.min(axis=1); path_max = prices.max(axis=1)
     pct = [10, 50, 90]
     return {
         "spot": float(spot),
@@ -210,86 +174,185 @@ def summarize_macro(prices: np.ndarray, spot: float, p_lo=10, p_hi=90):
         "path_max": path_max.astype(float),
     }
 
+# ============== Small helpers ==============
+def _normalize_symbol(raw: str) -> str:
+    s = (raw or "").strip().upper().replace("\\", "/").replace("-", "/")
+    if not s: return s
+    if "/" in s:
+        base, quote = s.split("/", 1)
+        base = base.strip(); quote = (quote or "USDT").strip() or "USDT"
+        return f"{base}/{quote}"
+    if s.endswith("USDT"):
+        base = s[:-4]; return f"{base}/USDT"
+    return f"{s}/USDT"
 
-# ====== Grid helpers ======
+def _prompt_symbol(default_symbol: str) -> str:
+    try: raw = input(f"Symbol to trade [default {default_symbol}]: ").strip()
+    except EOFError: raw = ""
+    return _normalize_symbol(raw) if raw else default_symbol
+
+def _parse_numbers_only(raw: str) -> Optional[float]:
+    if raw is None: return None
+    s = raw.strip()
+    if not s: return None
+    if not re.fullmatch(r"\d+(\.\d+)?", s): return None
+    try: return float(s)
+    except ValueError: return None
+
+def _prompt_budget(default_budget: float) -> float:
+    while True:
+        try: raw = input(f"Initial budget in USDT (numbers only) [default {default_budget:,.2f}]: ")
+        except EOFError: raw = ""
+        if not raw.strip(): return float(default_budget)
+        v = _parse_numbers_only(raw)
+        if v is not None and v > 0: return float(v)
+        print("Please enter a positive number (e.g., 1000, 1500.5).")
+
+def _prompt_tp_percent(default_tp_pct: float) -> float:
+    default_str = f"{default_tp_pct*100:.2f}"
+    while True:
+        try: raw = input(f"TP percent (numbers only) [default {default_str}%]: ").strip()
+        except EOFError: raw = ""
+        if not raw: return float(default_tp_pct)
+        v = _parse_numbers_only(raw)
+        if v is not None and v >= 0: return float(v)/100.0
+        print("Please enter a non-negative number (e.g., 1, 2.5).")
+
 def round_down_to_tick(x: float, tick: float) -> float:
     if tick <= 0: return float(x)
     return math.floor(x / tick) * tick
-
 
 def round_up_to_tick(x: float, tick: float) -> float:
     if tick <= 0: return float(x)
     return math.ceil(x / tick) * tick
 
+def snap_to_tick(x: float, tick: float) -> float:
+    if tick <= 0: return float(x)
+    return round(x / tick) * tick
 
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
+def _row_min_cost(px: float, min_notional: Optional[float], min_qty: Optional[float]) -> float:
+    """ขั้นต่ำต่อแถว ณ ราคา px (จาก exchange จริง) + buffer 1% แล้วปัดขึ้น 1 cent"""
+    req1 = float(min_notional or 0.0)
+    req2 = float(px) * float(min_qty or 0.0)
+    y = max(req1, req2)
+    return float(np.ceil((y * 1.01) * 100.0) / 100.0)
 
+def _zone_label(px: float, spot: float, used_low: float, used_high: float, z_near: float, z_mid: float) -> str:
+    if px <= spot:
+        denom = max(spot - used_low, 1e-12)
+        r = (spot - px) / denom
+    else:
+        denom = max(used_high - spot, 1e-12)
+        r = (px - spot) / denom
+    if r <= z_near: return "near"
+    if r <= z_mid:  return "mid"
+    return "far"
 
-def _split_budget(weight_lower_pct: Optional[float], total_budget: float) -> Tuple[float, float, float]:
-    ratio_lower = _clamp01((weight_lower_pct / 100.0) if (weight_lower_pct is not None) else 0.5)
-    b_lo = float(total_budget * ratio_lower)
-    b_up = float(total_budget - b_lo)
-    return ratio_lower, b_lo, b_up
+# ============== Single-panel allocator (descending slope) ==============
+def allocate_single_panel_desc(levels: np.ndarray,
+                               budget: float,
+                               min_notional: Optional[float],
+                               min_qty: Optional[float],
+                               qty_step: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    คืน (usd_alloc, coin_size) โดย:
+      - ขั้นต่ำต่อแถวจากตลาดจริง (minNotional/minQty)
+      - เงินต่อแถว "ลดลง" ตามราคา (ล่างมากสุด → บนน้อยสุด)
+      - เคารพ LOT_SIZE และพยายามบังคับโมโนโทนไม่เพิ่มขึ้นตามราคา
+      - binary search หา slope ให้รวม ≈ budget
+      - ถ้างบยังไม่พอขั้นต่ำทุกชั้น → ตัดชั้น "บนสุด" ออกจนพอดี
+    """
+    K = len(levels)
+    if K < 1:
+        return np.array([]), np.array([])
 
+    step = max(float(qty_step), 1e-12)
 
-def _side_of_order(px: float, spot: float, eps: float) -> str:
-    if px <= spot - eps: return "below"
-    if px >= spot + eps: return "above"
-    return "below" if px < spot else "above"
+    # ขั้นต่ำต่อแถว
+    row_min = np.array([_row_min_cost(float(p), min_notional, min_qty) for p in levels], dtype=float)
 
+    # ถ้างบไม่พอขั้นต่ำทั้งหมด → ตัดจาก "ปลายบน" ออกก่อน
+    keep = np.arange(K, dtype=int)
+    while row_min.sum() - 1e-9 > budget and len(keep) > 1:
+        keep = keep[:-1]  # ตัด index สุดท้าย (ราคาแพงสุด)
+        levels = levels[keep]
+        row_min = row_min[keep]
 
-def _ceil_cent(x: float, add_buffer_pct: float = 0.01) -> float:
-    y = float(x) * (1.0 + max(0.0, add_buffer_pct))
-    return float(np.ceil(y * 100.0) / 100.0)
+    if len(levels) == 0:
+        return np.array([]), np.array([])
 
+    K = len(levels)
+    if K == 1:
+        usd = min(row_min[0], budget)
+        size = math.floor(usd / max(levels[0],1e-12) / step) * step
+        if (min_qty or 0.0) > 0 and size < float(min_qty):
+            size = math.ceil(float(min_qty)/step) * step
+        usd = size * levels[0]
+        return np.array([usd]), np.array([size])
 
-def _w_min_at_price(px: float, min_notional: Optional[float], min_qty: Optional[float]) -> float:
-    req1 = float(min_notional) if (min_notional is not None) else 0.0
-    req2 = (float(px) * float(min_qty)) if (min_qty is not None) else 0.0
-    return _ceil_cent(max(req1, req2), add_buffer_pct=0.01)
+    # ให้ S เป็นส่วนเพิ่มฝั่งล่าง แล้วไล่ "ลด" ไปจนบน
+    # factor_i = (K-1-i)/(K-1)  -> i=0 (ล่าง) = 1, i=K-1 (บน) = 0
+    def sum_given_S(S: float, return_series=False):
+        prev_usd = float('inf')
+        usd_list, size_list = [], []
+        for i, px in enumerate(levels):
+            base = row_min[i]
+            factor = (K - 1 - i) / (K - 1)
+            target = base + S * factor           # ล่างมากสุด → บนน้อยสุด
+            cap_target = min(target, prev_usd)   # โมโนโทนไม่เพิ่มขึ้นตามราคา
 
+            size = math.floor(cap_target / max(px,1e-12) / step) * step
+            if (min_qty or 0.0) > 0 and size < float(min_qty):
+                size = math.ceil(float(min_qty)/step) * step
+            usd = size * px
 
-def _bump_to_min_notional(row, w_min: float, qstep: float):
-    px = float(row["buy_price"])
-    cur_qty = float(row["coin_size"])
-    need_qty = np.ceil((w_min / max(px, 1e-12)) / qstep) * qstep
-    if cur_qty + 1e-12 >= need_qty:
-        return row, 0.0
-    row["coin_size"] = float(need_qty)
-    row["usd_alloc"] = float(need_qty * px)
-    return row, float(row["usd_alloc"] - cur_qty * px)
+            # บังคับ >= ขั้นต่ำ
+            if usd + 1e-12 < row_min[i]:
+                size = math.ceil(row_min[i] / max(px,1e-12) / step) * step
+                usd = size * px
 
+            # โมโนโทนแบบเข้มขึ้น: ถ้าดันเกิน prev_usd (เจอกรณี minQty*price ครอง) → clamp ลงเท่าที่ LOT อนุญาต
+            if usd > prev_usd + 1e-12:
+                size = math.floor(prev_usd / max(px,1e-12) / step) * step
+                usd = size * px
+                # ถ้าคลัมป์แล้วต่ำกว่าขั้นต่ำอีก ก็ยอม "หลุดโมโนโทน" ตรงนี้เพื่อเคารพขั้นต่ำ
+                if usd + 1e-12 < row_min[i]:
+                    size = math.ceil(row_min[i] / max(px,1e-12) / step) * step
+                    usd = size * px
+            prev_usd = usd
+            usd_list.append(usd); size_list.append(size)
+        tot = float(np.sum(usd_list))
+        if return_series:
+            return tot, np.array(usd_list), np.array(size_list)
+        return tot
 
-def _enforce_min_notional_per_side(df_side: pd.DataFrame,
-                                   budget_side: float,
-                                   w_min: float,
-                                   qstep: float,
-                                   spot: float,
-                                   side_name: str,
-                                   drop_policy: str) -> pd.DataFrame:
-    # 1) ยกออเดอร์ให้ผ่านขั้นต่ำ
-    rows = []
-    for _, r in df_side.iterrows():
-        r2, _ = _bump_to_min_notional(r.copy(), w_min, qstep)
-        rows.append(r2)
-    df_side = pd.DataFrame(rows)
+    # หา S ด้วย binary search
+    S_lo, S_hi = 0.0, 1.0
+    # ขยาย S_hi จนรวม >= budget หรือถึงเพดาน
+    while sum_given_S(S_hi) < budget and S_hi < 1e9:
+        S_hi *= 2.0
+    for _ in range(50):
+        S_mid = 0.5 * (S_lo + S_hi)
+        s = sum_given_S(S_mid)
+        if s > budget:
+            S_hi = S_mid
+        else:
+            S_lo = S_mid
+    _, usd_final, size_final = sum_given_S(S_lo, return_series=True)
 
-    # 2) ถ้าเกินงบ → ตัดออก
-    def _dist(px: float) -> float:
-        return (spot - px) if side_name == "below" else (px - spot)
+    # เติมเศษงบที่เหลือให้ "แถวล่างสุด" เท่านั้น (ยังคงโมโนโทน)
+    remain = budget - float(np.sum(usd_final))
+    if remain > 0 and K >= 1:
+        i = 0  # ล่างสุด
+        px = levels[i]
+        add = math.floor(remain / max(px,1e-12) / step) * step
+        if add > 0:
+            size_final[i] += add
+            usd_final[i] = size_final[i] * px
 
-    while df_side["usd_alloc"].sum() > budget_side and len(df_side) > 1:
-        if drop_policy == "smallest":
-            drop_idx = df_side["usd_alloc"].idxmin()
-        else:  # farthest
-            drop_idx = df_side["buy_price"].apply(_dist).idxmax()
-        df_side = df_side.drop(index=drop_idx)
+    return usd_final, size_final
 
-    return df_side
-
-
-# ====== CSV export (macro) ======
+# ============== CSV Export (macro) ==============
 def export_macro_csv(path_min: np.ndarray, path_max: np.ndarray, cfg_out: dict, out_path: str):
     paths_df = pd.DataFrame({
         "path_id": np.arange(len(path_min), dtype=int),
@@ -327,106 +390,30 @@ def export_macro_csv(path_min: np.ndarray, path_max: np.ndarray, cfg_out: dict, 
     out_all = pd.concat([paths_df, summ_df], ignore_index=True)
     out_all.to_csv(out_path, index=False)
 
-
-# ====== Symbol, budget & TP prompts ======
-def _normalize_symbol(raw: str) -> str:
-    s = (raw or "").strip().upper().replace("\\", "/").replace("-", "/")
-    if not s:
-        return s
-    if "/" in s:
-        base, quote = s.split("/", 1)
-        base = base.strip()
-        quote = (quote or "USDT").strip() or "USDT"
-        return f"{base}/{quote}"
-    if s.endswith("USDT"):
-        base = s[:-4]
-        return f"{base}/USDT"
-    return f"{s}/USDT"
-
-
-def _prompt_symbol(default_symbol: str) -> str:
-    try:
-        raw = input(f"Symbol to trade [default {default_symbol}]: ").strip()
-    except EOFError:
-        raw = ""
-    sym = _normalize_symbol(raw) if raw else default_symbol
-    return sym
-
-
-def _parse_numbers_only(raw: str) -> Optional[float]:
-    if raw is None:
-        return None
-    s = raw.strip()
-    if not s:
-        return None
-    if not re.fullmatch(r"\d+(\.\d+)?", s):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _prompt_budget(default_budget: float) -> float:
-    while True:
-        try:
-            raw = input(f"Initial budget in USDT (numbers only) [default {default_budget:,.2f}]: ")
-        except EOFError:
-            raw = ""
-        if not raw.strip():
-            return float(default_budget)
-        val = _parse_numbers_only(raw)
-        if val is not None and val > 0:
-            return float(val)
-        print("Please enter a positive number without commas or units (e.g., 1000, 1500.5), or press Enter to use default.")
-
-
-def _prompt_tp_percent(default_tp_pct: float) -> float:
-    """รับค่า TP เป็นเปอร์เซ็นต์ (ตัวเลขล้วน เช่น 1 = 1%) แล้วแปลงเป็นสัดส่วน 0–1"""
-    default_str = f"{default_tp_pct*100:.2f}"
-    while True:
-        try:
-            raw = input(f"TP percent (numbers only) [default {default_str}%]: ").strip()
-        except EOFError:
-            raw = ""
-        if not raw:
-            return float(default_tp_pct)
-        val = _parse_numbers_only(raw)
-        if val is not None and val >= 0:
-            return float(val) / 100.0
-        print("Please enter a non-negative number without commas or % (e.g., 1, 2.5), or press Enter to use default.")
-
-
-# ====== MAIN PIPELINE ======
+# ============== MAIN ==============
 def main():
-    # --- รับสัญลักษณ์, เงินต้น และ TP% จากผู้ใช้ ---
-    chosen_symbol = _prompt_symbol(CFG["symbol"])
-    chosen_budget = _prompt_budget(CFG["BUDGET_USD"])
-    chosen_tp_pct = _prompt_tp_percent(CFG["TP_PCT"])
+    # รับค่าจากผู้ใช้
+    sym = _prompt_symbol(CFG["symbol"])
+    budget = _prompt_budget(CFG["BUDGET_USD"])
+    tp_pct = _prompt_tp_percent(CFG["TP_PCT"])
 
-    # ใช้สำเนา CFG เพื่ออัปเดตค่าที่ผู้ใช้เลือก
     c = dict(CFG)
-    c["symbol"] = chosen_symbol
-    c["BUDGET_USD"] = float(chosen_budget)
-    c["TP_PCT"] = float(chosen_tp_pct)
+    c["symbol"] = sym
+    c["BUDGET_USD"] = float(budget)
+    c["TP_PCT"] = float(tp_pct)
 
     rng = np.random.default_rng()
 
-    # -- Single CCXT client --
+    # ccxt
     bx = BinanceClient(timeout_ms=c["http_timeout_ms"])
     bx.load_markets(retries=c["http_retries"], backoff=c["retry_backoff_base_sec"])
-
-    # ตรวจว่ามีสัญลักษณ์ในตลาดจริงไหม
     if c["symbol"] not in bx.markets:
-        raise ValueError(
-            f"Symbol '{c['symbol']}' not found on Binance spot. "
-            f"Example: BTC/USDT, ETH/USDT, XRP/USDT"
-        )
+        raise ValueError(f"Symbol '{c['symbol']}' not found on Binance spot.")
 
     m = bx.market(c["symbol"])
     min_notional, min_qty, price_tick, qty_step = _extract_meta_from_market(m)
 
-    # -- OHLCV --
+    # OHLCV
     print(f"[i] Fetching {c['symbol']} {c['timeframe']} OHLCV (last {c['lookback_bars']} bars)...")
     df = bx.fetch_ohlcv_1d(c["symbol"], c["lookback_bars"], c["http_retries"], c["retry_backoff_base_sec"])
     close = df["close"].to_numpy(dtype=float)
@@ -437,7 +424,7 @@ def main():
     print(f"[i] Budget: {c['BUDGET_USD']:,.2f} USDT")
     print(f"[i] TP: {c['TP_PCT']*100:.2f}%")
 
-    # -- Monte Carlo --
+    # Monte Carlo
     print(f"[i] MC: paths={c['paths']:,}, horizon={c['horizon_bars']}, block_len={c['block_len']}")
     log_paths = block_bootstrap_returns(logret, c["horizon_bars"], c["block_len"], c["paths"], rng)
     prices = simulate_price_paths(spot, log_paths)
@@ -446,7 +433,7 @@ def main():
     band_low, band_high = float(summ["band_low"]), float(summ["band_high"])
     width = band_high - band_low
 
-    # -- AUTO params from MC/market tick --
+    # frame จาก MC
     grid_min_step = float(price_tick) if price_tick and price_tick > 0 else 0.1
     lower_level = round_down_to_tick(band_low, grid_min_step)
     upper_level = round_up_to_tick(band_high, grid_min_step)
@@ -455,10 +442,10 @@ def main():
     if upper_level <= spot:
         upper_level = round_up_to_tick(spot + grid_min_step, grid_min_step)
 
-    theoretical_layers = max(0, int(math.floor((upper_level - lower_level) / max(grid_min_step, 1e-12))) - 1)
-    max_layers = int(max(c["MIN_LAYERS_FLOOR"], min(c["MAX_LAYERS_CAP"], theoretical_layers)))
+    theoretical_layers = max(0, int(math.floor((upper_level - lower_level) / max(grid_min_step, 1e-12))) + 1)
+    max_layers = int(min(c["MAX_LAYERS_CAP"], theoretical_layers))
 
-    # -- Write macro CSV --
+    # macro CSV
     cfg_out = dict(c)
     cfg_out.update({
         "lower_level": lower_level,
@@ -468,188 +455,83 @@ def main():
         "price_tick": price_tick,
         "qty_step": qty_step,
         "_summary": {
-            "spot": summ["spot"],
-            "min_pct": summ["min_pct"],
-            "max_pct": summ["max_pct"],
-            "band_low": band_low,
-            "band_high": band_high,
+            "spot": summ["spot"], "min_pct": summ["min_pct"], "max_pct": summ["max_pct"],
+            "band_low": band_low, "band_high": band_high,
         }
     })
     export_macro_csv(summ["path_min"], summ["path_max"], cfg_out, c["macro_csv"])
     print(f"[i] Saved macro: {c['macro_csv']}")
 
-    # ===== GRID PLANNER =====
-    GRID_MODE = c["GRID_MODE"]
-    LOWER_STRETCH_PCT = float(c["LOWER_STRETCH_PCT"])
-    _stretch_factor = 1.0 + max(0.0, LOWER_STRETCH_PCT) / 100.0
+    # ===== เลือกจำนวนชั้นคร่าว ๆ แล้วสร้างเลเวลแบบ equal-step ทั้งช่วง =====
+    w_min_top = _row_min_cost(upper_level, min_notional, min_qty)  # โดยมากโดน minNotional ครอง
+    target_each = w_min_top * max(1.0, float(c["TARGET_MIN_MULTIPLIER"]))
+    K_est = int(max(2, min(max_layers, math.floor(c["BUDGET_USD"] / max(target_each, 1e-9)))))
+    if int(c.get("LEVELS_CAP") or 0) > 0:
+        K_est = min(K_est, int(c["LEVELS_CAP"]))
+    if K_est < 2:
+        K_est = 2
 
-    # กรอบใช้งานจริง (ยืดล่างมากกว่าบนเล็กน้อย)
-    delta_up = max(1e-9, band_high - spot)
-    delta_dn = max(1e-9, spot - band_low)
-    half_sym = max(delta_up, delta_dn)
-    used_low = max(0.0, spot - half_sym * _stretch_factor)
-    used_high = spot + half_sym
+    raw_levels = np.linspace(lower_level, upper_level, K_est)
+    levels = np.array([snap_to_tick(x, price_tick) for x in raw_levels], dtype=float)
+    levels = np.unique(levels)
+    if len(levels) < 2:
+        levels = np.array([lower_level, upper_level], dtype=float)
 
-    # แบ่งงบ
-    ratio_lower, budget_below, budget_above = _split_budget(
-        c["BUDGET_LOWER_WEIGHT"] if c["BUDGET_LOWER_WEIGHT"] is not None else c["LEVELS_LOWER_WEIGHT"],
-        c["BUDGET_USD"]
+    # ===== Single-panel (descending slope) =====
+    usd_alloc, coin_size = allocate_single_panel_desc(
+        levels=levels,
+        budget=float(c["BUDGET_USD"]),
+        min_notional=min_notional,
+        min_qty=min_qty,
+        qty_step=qty_step
     )
-    EPS = price_tick * 0.5
 
-    # w_min ณ จุดไกลสุดแต่ละฝั่ง
-    below_far_price = used_low if GRID_MODE == "split" else max(0.0, spot - half_sym * _stretch_factor)
-    above_far_price = used_high if GRID_MODE == "split" else (spot + half_sym)
-    w_min_below_far = _w_min_at_price(below_far_price, min_notional, min_qty)
-    w_min_above_far = _w_min_at_price(above_far_price, min_notional, min_qty)
+    if len(usd_alloc) == 0:
+        print("\nคำสั่งซื้อ (Orders): ไม่มีออเดอร์ที่สร้างได้จากข้อจำกัดงบ/ขั้นต่ำในตอนนี้")
+        return
 
-    K_cap_below = int(np.floor(budget_below / max(w_min_below_far, 1e-12)))
-    K_cap_above = int(np.floor(budget_above / max(w_min_above_far, 1e-12)))
+    # labels เพื่อแสดงผล
+    zones, sides = [], []
+    for px in levels:
+        side = "below" if px < spot else ("above" if px > spot else "at")
+        sides.append(side if side != "at" else ("below" if px <= spot else "above"))
+        zones.append(_zone_label(px, spot, lower_level, upper_level, c["ZONE_NEAR"], c["ZONE_MID"]))
 
-    def _apply_min_each(k_cap: int, budget_side: float, w_min_side: float) -> int:
-        if k_cap <= 0: return 0
-        if c["MIN_SIDE_LEVELS"] <= 1: return k_cap
-        if budget_side >= (w_min_side * c["MIN_SIDE_LEVELS"]):
-            return max(c["MIN_SIDE_LEVELS"], k_cap)
-        return k_cap
+    tp_price = levels * (1.0 + c["TP_PCT"])
+    net_pct_est = np.maximum(c["TP_PCT"] - 2.0 * c["FEE_RATE"], 0.0)
 
-    K_below = _apply_min_each(K_cap_below, budget_below, w_min_below_far)
-    K_above = _apply_min_each(K_cap_above, budget_above, w_min_above_far)
+    orders_df = pd.DataFrame({
+        "side": sides,
+        "zone": zones,
+        "buy_price": levels.astype(float),
+        "usd_alloc": usd_alloc.astype(float),
+        "coin_size": coin_size.astype(float),
+        "tp_price": tp_price.astype(float),
+        "net_pct_est": net_pct_est,
+    }).sort_values("buy_price").reset_index(drop=True)
 
-    print("\n[i] Grid frame (used):")
-    print(f"    spot        : {spot:.6f}")
-    print(f"    MC band     : {band_low:.6f} → {band_high:.6f}")
-    print(f"    USED band   : {used_low:.6f} → {used_high:.6f}   (mode={GRID_MODE}, lower stretch +{LOWER_STRETCH_PCT:.1f}%)")
+    # รายงาน
+    print("\n=== แผนวางกริด (แผงเดียว: เงินลดลงตามราคา) ===")
+    print(f"ราคาปัจจุบัน (Spot): {spot:.6f} | ช่วงกรอบใช้จริง (Band): {lower_level:.6f} → {upper_level:.6f}")
+    print(f"เลเวลทั้งหมด: {len(orders_df)} ชั้น | ใช้งบรวม ≈ {orders_df['usd_alloc'].sum():,.2f}/{c['BUDGET_USD']:,.2f} USDT\n")
+    print("คำสั่งซื้อ (Orders):")
+    print("SIDE | ZONE | buy_price | usd_alloc | coin_size | tp_price | net_pct_est")
+    for _, r in orders_df.iterrows():
+        print(f"{str(r['side']):>5} | {str(r['zone']):>4} | {float(r['buy_price']):.6f} | {float(r['usd_alloc']):>8.2f} "
+              f"| {float(r['coin_size']):>9.6f} | {float(r['tp_price']):.6f} | {float(r['net_pct_est']):.4%}")
 
-    print("\n[i] Max feasible levels from budget + min at far point:")
-    print(f"    below: cap={K_cap_below} (w_min≈{w_min_below_far:.2f} @ px≈{below_far_price:.6f})  budget={budget_below:,.2f}")
-    print(f"    above: cap={K_cap_above} (w_min≈{w_min_above_far:.2f} @ px≈{above_far_price:.6f})  budget={budget_above:,.2f}")
-
-    if K_below == 0: print("[warn] Budget below side insufficient for 1 order at far point.")
-    if K_above == 0: print("[warn] Budget above side insufficient for 1 order at far point.")
-
-    orders = []
-
-    if GRID_MODE == "split":
-        # BELOW
-        if K_below > 0 and budget_below > 0:
-            res_below = build_grid(
-                spot=spot, band_low=used_low, band_high=spot,
-                budget_usd=budget_below, K=K_below,
-                method="equal_prob", mc_mins_samples=summ["path_min"],
-                alpha=0.8, w_min=w_min_below_far, w_max=max(w_min_below_far, 50.0),
-                fee_rate=c["FEE_RATE"], tp_pct=c["TP_PCT"],
-                zone_near=c["ZONE_NEAR"], zone_mid=c["ZONE_MID"], weight_scheme=c["WEIGHT_SCHEME"],
-                price_tick=price_tick, qty_step=qty_step
-            )
-            orders_below = [o for o in (res_below.get("orders") or []) if o.get("buy_price", 0.0) <= (spot - EPS)]
-        else:
-            orders_below = []
-
-        # ABOVE
-        if K_above > 0 and budget_above > 0:
-            res_above = build_grid(
-                spot=spot, band_low=spot - EPS, band_high=used_high,
-                budget_usd=budget_above, K=K_above,
-                method="equal_prob", mc_mins_samples=summ["path_min"],
-                alpha=0.8, w_min=w_min_above_far, w_max=max(w_min_above_far, 50.0),
-                fee_rate=c["FEE_RATE"], tp_pct=c["TP_PCT"],
-                zone_near=c["ZONE_NEAR"], zone_mid=c["ZONE_MID"], weight_scheme=c["WEIGHT_SCHEME"],
-                price_tick=price_tick, qty_step=qty_step
-            )
-            orders_above_raw = res_above.get("orders") or []
-            orders_above = [o for o in orders_above_raw if o.get("buy_price", 0.0) >= (spot + EPS)]
-            if not orders_above and orders_above_raw:
-                orders_above = [o for o in orders_above_raw if o.get("buy_price", 0.0) >= spot]
-        else:
-            orders_above = []
-
-        orders = orders_below + orders_above
-
-    else:  # symmetric
-        K_total_auto = max(0, K_below) + max(0, K_above)
-        if K_total_auto > 0:
-            res = build_grid(
-                spot=spot,
-                band_low=max(0.0, spot - half_sym * _stretch_factor),
-                band_high=spot + half_sym,
-                budget_usd=c["BUDGET_USD"], K=K_total_auto,
-                method="equal_prob", mc_mins_samples=summ["path_min"],
-                alpha=0.8, w_min=min(w_min_below_far, w_min_above_far),
-                w_max=max(w_min_below_far, w_min_above_far, 50.0),
-                fee_rate=c["FEE_RATE"], tp_pct=c["TP_PCT"],
-                zone_near=c["ZONE_NEAR"], zone_mid=c["ZONE_MID"], weight_scheme=c["WEIGHT_SCHEME"],
-                price_tick=price_tick, qty_step=qty_step
-            )
-            orders = res.get("orders") or []
-        else:
-            orders = []
-
-    # ===== Post-process & enforce =====
-    print("\n=== แผนวางกริด (โหมด: %s) ===" % GRID_MODE)
-    print(f"ราคาปัจจุบัน (Spot): {spot:.6f} | ช่วงกรอบใช้จริง (Band): {used_low:.6f} → {used_high:.6f}")
-    print(f"เพดานชั้นที่ใช้จริง  lower/upper = {K_below}/{K_above}  |  งบ lower/upper = {budget_below:,.2f}/{budget_above:,.2f} USDT")
-
-    orders_df = pd.DataFrame(orders).copy()
-    if not orders_df.empty and {"tp_price", "buy_price"}.issubset(orders_df.columns):
-        bad = orders_df["tp_price"] < orders_df["buy_price"]
-        if bad.any():
-            orders_df.loc[bad, "tp_price"] = orders_df.loc[bad, "buy_price"] * (1.0 + c["TP_PCT"])
-
-    if not orders_df.empty and "buy_price" in orders_df.columns:
-        orders_df = orders_df.sort_values("buy_price").reset_index(drop=True)
-
-    if not orders_df.empty:
-        orders_df["side"] = orders_df["buy_price"].apply(lambda px: _side_of_order(px, spot, EPS))
-
-    if c["ENFORCE_MIN_NOTIONAL"] and not orders_df.empty:
-        below_df = orders_df[orders_df["side"] == "below"].copy()
-        above_df = orders_df[orders_df["side"] == "above"].copy()
-
-        if not below_df.empty:
-            below_df = _enforce_min_notional_per_side(below_df, budget_below, w_min_below_far, qty_step, spot, "below", c["DROP_POLICY"])
-        if not above_df.empty:
-            above_df = _enforce_min_notional_per_side(above_df, budget_above, w_min_above_far, qty_step, spot, "above", c["DROP_POLICY"])
-
-        orders_df = pd.concat([below_df, above_df], ignore_index=True)
-
-        # safety re-check
-        if {"tp_price", "buy_price"}.issubset(orders_df.columns):
-            bad = orders_df["tp_price"] < orders_df["buy_price"]
-            if bad.any():
-                orders_df.loc[bad, "tp_price"] = orders_df.loc[bad, "buy_price"] * (1.0 + c["TP_PCT"])
-        if "buy_price" in orders_df.columns:
-            orders_df = orders_df.sort_values("buy_price").reset_index(drop=True)
-
-        tot_below = orders_df.loc[orders_df["side"]=="below", "usd_alloc"].sum()
-        tot_above = orders_df.loc[orders_df["side"]=="above", "usd_alloc"].sum()
-        print("\n[i] หลัง enforce ขั้นต่ำ/คุมงบ:")
-        print(f"    ฝั่งล่างใช้ {tot_below:,.2f}/{budget_below:,.2f} USDT | ฝั่งบนใช้ {tot_above:,.2f}/{budget_above:,.2f} USDT")
-
-    # ===== Save grid plan =====
-    if orders_df.empty:
-        print("\nคำสั่งซื้อ (Orders): ไม่มีออเดอร์ที่สร้างได้จากข้อจำกัดงบและขั้นต่ำในตอนนี้")
-    else:
-        print("\nคำสั่งซื้อ (Orders):")
-        print("SIDE | ZONE | buy_price | usd_alloc | coin_size | tp_price | net_pct_est")
-        for _, r in orders_df.iterrows():
-            side = r.get("side", "")
-            zone = r.get("zone", "")
-            print(f"{str(side):>5} | {str(zone):>4} | {float(r['buy_price']):.6f} | {float(r['usd_alloc']):>8.2f} "
-                  f"| {float(r['coin_size']):>9.6f} | {float(r['tp_price']):.6f} | {float(r.get('net_pct_est', 0.0092)):.4%}")
-
+    # Save
     orders_df.to_csv(c["grid_csv"], index=False)
     print(f"\n[i] บันทึกแผนกริดลงไฟล์: {c['grid_csv']} เรียบร้อยแล้ว")
 
-    # ===== Summary =====
+    # สรุป
     print("\n=== Summary (AUTO) ===")
     print(f" Spot: {spot:.6f}")
     print(f" Band p{p_lo}..p{p_hi}: {band_low:.6f} → {band_high:.6f} (width {width:.6f})")
     print(f" AUTO lower_level: {lower_level:.6f} | AUTO upper_level: {upper_level:.6f}")
     print(f" AUTO grid_min_step (price tick): {grid_min_step}")
-    print(f" AUTO max_layers: {max_layers} (theoretical ~ {theoretical_layers})")
+    print(f" AUTO max_layers: {max_layers}  |  Levels used: {len(orders_df)}")
     print(f" Done at (GMT+7): {datetime.now(ZoneInfo('Asia/Bangkok')).strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
 
 if __name__ == "__main__":
     main()
