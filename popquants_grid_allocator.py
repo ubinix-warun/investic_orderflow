@@ -1,5 +1,5 @@
 # popquants_grid_allocator.py
-# Quant-only grid allocator (no TA) with reversible weighting toward FAR zone
+# Quant-only grid allocator with reversible weighting toward FAR zone
 
 from __future__ import annotations
 import numpy as np
@@ -80,46 +80,49 @@ def _levels_equal_step(spot: float, band_low: float, band_high: float, K: int) -
     levels = np.linspace(band_low, band_high, K)  # สร้าง grid ทั้งสองฝั่ง
     return levels
 
-def _make_weights(levels: np.ndarray, spot: float, band_low: float, budget_usd: float,
-                  w_min: float, w_max: float, alpha: float,
+def _make_weights(levels: np.ndarray, spot: float, band_low: float, band_high: float,
+                  budget_usd: float, w_min: float, w_max: float, alpha: float,
                   scheme: WeightScheme) -> np.ndarray:
     """
-    คืน weights ต่อเลเวลตามสกีม
-    - near_heavier: ใกล้ spot หนักกว่า → r = (1 - d)^alpha
-    - far_heavier : ไกล spot หนักกว่า → r = d^alpha
-    จากนั้น normalize เป็นงบรวม และ clamp ทีละรอบให้เคารพ [w_min, w_max]
+    ระยะ d ต่อเลเวล:
+      - ถ้าราคาต่ำกว่า spot:  d = (spot - level) / (spot - band_low)
+      - ถ้าราคาสูงกว่า spot:  d = (level - spot) / (band_high - spot)
+    แล้วแปลงเป็นน้ำหนักตาม scheme:
+      near_heavier: r = (1 - d)^alpha   (ใกล้ spot หนัก)
+      far_heavier : r = d^alpha         (ไกล spot หนัก)
     """
-    denom = max(spot - band_low, 1e-12)
-    d = np.clip((spot - levels) / denom, 0.0, 1.0)  # near≈0, far≈1
+    levels = np.asarray(levels, dtype=float)
+    denom_down = max(spot - band_low, 1e-12)
+    denom_up   = max(band_high - spot, 1e-12)
+
+    d = np.empty_like(levels, dtype=float)
+    below = levels <= spot
+    above = ~below
+    d[below] = np.clip((spot - levels[below]) / denom_down, 0.0, 1.0)
+    d[above] = np.clip((levels[above] - spot) / denom_up, 0.0, 1.0)
 
     if scheme == "near_heavier":
         r = np.power(1.0 - d, alpha)
-    else:  # far_heavier
+    else:  # "far_heavier"
         r = np.power(d, alpha)
 
-    # หากร รวมเป็นศูนย์ (กรณีสุดโต่ง) → กระจายเท่ากัน
     if np.all(r <= 1e-12):
         r = np.ones_like(r)
 
     w = r / r.sum() * budget_usd
 
-    # clamp ให้อยู่ใน [w_min, w_max] พร้อมรักษาผลรวมใกล้ budget
-    def clamp_and_renorm(w):
-        w = np.clip(w, w_min, w_max)
-        total = w.sum()
-        if total <= 1e-9:
-            return w
-        # scale ให้ใกล้ budget ถ้าไม่ชนกรอบทั้งหมด
-        scale = budget_usd / total
-        w = w * scale
-        # อีกรอบเพื่อให้แน่ใจว่าไม่ทะลุกรอบ
-        w = np.clip(w, w_min, w_max)
-        # ถ้าบางจุดชนกรอบแล้วรวมไม่เท่าบั๊ดเจ็ต ก็ยอมให้ sums ต่างเล็กน้อย
-        return w
+    def clamp_and_renorm(wv):
+        wv = np.clip(wv, w_min, w_max)
+        tot = wv.sum()
+        if tot > 1e-9:
+            wv = wv * (budget_usd / tot)
+            wv = np.clip(wv, w_min, w_max)
+        return wv
 
     for _ in range(3):
         w = clamp_and_renorm(w)
     return w
+
 
 def build_grid(
     *,
@@ -133,7 +136,7 @@ def build_grid(
     # shape of weighting
     alpha: float = 0.7,
     # per-level dollar bounds
-    w_min: float = 5.0,
+    w_min: Optional[float] = None,
     w_max: float = 50.0,
     # trading params
     fee_rate: float = 0.0004,
@@ -154,7 +157,6 @@ def build_grid(
       - totals
       - spot / band_low / band_high
     """
-
     if band_low >= spot:
         raise ValueError("band_low must be < spot")
 
@@ -167,10 +169,15 @@ def build_grid(
 
     zones = _zones_from_distance(levels, spot, band_low, band_high, zone_near, zone_mid)
 
+    # >>> บังคับให้ w_min มาจากตลาดจริงเท่านั้น
+    if w_min is None:
+        raise ValueError("w_min must be provided by caller (derive from exchange minNotional/minQty).")
+
     # สร้างน้ำหนัก “กลับด้านได้” ตาม weight_scheme
     weights = _make_weights(
-        levels=levels, spot=spot, band_low=band_low, budget_usd=budget_usd,
-        w_min=w_min, w_max=w_max, alpha=alpha, scheme=weight_scheme
+        levels=levels, spot=spot, band_low=band_low, band_high=band_high,
+        budget_usd=budget_usd, w_min=w_min, w_max=w_max,
+        alpha=alpha, scheme=weight_scheme
     )
 
     # คำนวณออเดอร์
@@ -187,10 +194,8 @@ def build_grid(
         size = _round_qty(size, qty_step)
 
         # คำนวณ TP price: ฝั่งลงใช้ +tp_pct, ฝั่งขึ้นใช้ -tp_pct (ขายต่ำกว่าราคาซื้อ)
-        if lvl <= spot:
-            tp_price = _round_price(buy_p * (1.0 + tp_pct), price_tick)  # ฝั่งลง: ขายสูงกว่า
-        else:
-            tp_price = _round_price(buy_p * (1.0 - tp_pct), price_tick)  # ฝั่งขึ้น: ขายต่ำกว่า
+        tp_price = _round_price(buy_p * (1.0 + tp_pct), price_tick)
+
 
         # ถ้า rounding ทำให้ไม่เหลือ size → ข้ามเลเวลนี้
         if size <= 0.0:
