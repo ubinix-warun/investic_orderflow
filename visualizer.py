@@ -1,175 +1,212 @@
 # visualizer.py
-import os
-import time
-import numpy as np
-import pandas as pd
-import altair as alt
 import streamlit as st
+import subprocess, threading, queue, sys, os, time, re
+from collections import deque
+from datetime import datetime
 
-# ========== Page setup ==========
-DEFAULT_SYMBOL = "XRP/USDT"
+# =========================
+# Settings (ปรับได้จาก UI)
+# =========================
+DEFAULT_BOT_PATH = "grid_bot.py"
+DEFAULT_REFRESH_MS = 3000
+DEFAULT_MAX_KEEP = 5000
 DEFAULT_LOG_DIR = "logs"
+ERRORS_ONLY_LOG = os.path.join(DEFAULT_LOG_DIR, "errors_only.log")
 
-st.set_page_config(page_title="CVD_z & TS_z Monitor", layout="wide")
-st.title("CVD_z & TS_z — Streamlit Monitor")
+# =========================
+# Utilities
+# =========================
+def ensure_dirs():
+    os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
 
-# ========== Sidebar ==========
-symbol = st.sidebar.text_input("Symbol (Base/Quote)", value=DEFAULT_SYMBOL)
-symbol_safe = symbol.replace("/", "").lower()
-default_csv = os.path.join(DEFAULT_LOG_DIR, f"{symbol_safe}_5s_decisions.csv")
-
-csv_path = st.sidebar.text_input("CSV path", value=default_csv)
-refresh_sec = st.sidebar.slider("Auto-refresh every (sec)", 1, 10, 2)
-win_minutes = st.sidebar.slider("Window (minutes)", 5, 240, 60)
-cvd_z_th = st.sidebar.number_input("CVD_z threshold line", value=0.0, step=0.1, format="%.2f")
-ts_z_th  = st.sidebar.number_input("TS_z threshold line",  value=0.0, step=0.1, format="%.2f")
-
-# ========== Helpers ==========
-def _coerce_float(x):
-    try:
-        if pd.isna(x):
-            return np.nan
-        if isinstance(x, str) and x.strip().lower() in ("nan", ""):
-            return np.nan
-        return float(x)
-    except Exception:
-        return np.nan
-
-def load_csv(path: str, minutes_window: int) -> pd.DataFrame:
-    """อ่านไฟล์, ทำเวลาเป็น tz-aware UTC, คัดเฉพาะหน้าต่าง minutes_window นาทีล่าสุด"""
-    if not os.path.exists(path):
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(path)
-    except Exception as e:
-        st.error(f"อ่านไฟล์ไม่ได้: {e}")
-        return pd.DataFrame()
-
-    # เวลา → UTC tz-aware
-    if "bar_time_utc" in df.columns:
-        df["time"] = pd.to_datetime(df["bar_time_utc"], utc=True, errors="coerce")
-    elif "bar_ts_ms" in df.columns:
-        df["time"] = pd.to_datetime(df["bar_ts_ms"], unit="ms", utc=True, errors="coerce")
-    else:
-        # เผื่อชื่ออื่น ๆ
-        for cand in ("time", "timestamp", "ts", "ts_ms"):
-            if cand in df.columns:
-                if pd.api.types.is_numeric_dtype(df[cand]):
-                    df["time"] = pd.to_datetime(df[cand], unit="ms", utc=True, errors="coerce")
-                else:
-                    df["time"] = pd.to_datetime(df[cand], utc=True, errors="coerce")
-                break
-        else:
-            return pd.DataFrame()
-
-    # ให้แน่ใจว่าเป็น tz-aware(UTC)
-    if getattr(df["time"].dt, "tz", None) is None:
-        df["time"] = df["time"].dt.tz_localize("UTC")
-    else:
-        df["time"] = df["time"].dt.tz_convert("UTC")
-
-    # คอลัมน์ที่ต้องใช้
-    needed = [
-        "dq","mid","cvd_z","ts_z","confirm_count",
-        "buy_signal_confirmed","grid_candidate","action","reason"
-    ]
-    for c in needed:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    # types
-    df["cvd_z"] = df["cvd_z"].apply(_coerce_float)
-    df["ts_z"]  = df["ts_z"].apply(_coerce_float)
-    df["mid"]   = df["mid"].apply(_coerce_float)
-    df["confirm_count"] = pd.to_numeric(df["confirm_count"], errors="coerce").fillna(0).astype(int)
-    df["buy_signal_confirmed"] = pd.to_numeric(df["buy_signal_confirmed"], errors="coerce").fillna(0).astype(int)
-    df["action"] = df["action"].astype(str).fillna("")
-
-    # ตัดหน้าต่างล่าสุด
-    now_utc = pd.Timestamp.now(tz="UTC")
-    cutoff = now_utc - pd.Timedelta(minutes=minutes_window)
-    df = df[(df["time"] >= cutoff) & df["time"].notna()].copy()
-
-    df.sort_values("time", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-def safe_altair_chart(chart):
-    """รองรับทั้งเวอร์ชันใหม่/เก่าของ Streamlit"""
-    try:
-        # เวอร์ชันใหม่ (แนะนำ)
-        st.altair_chart(chart, width="stretch")
-    except TypeError:
-        # เวอร์ชันเก่า
-        st.altair_chart(chart, use_container_width=True)
-
-# ========== Load data ==========
-df = load_csv(csv_path, win_minutes)
-
-# ========== Metrics ==========
-def show_metrics(df: pd.DataFrame):
-    if df.empty:
-        st.warning("No data yet.")
+def tail_write(path: str, lines: list[str]):
+    if not lines:
         return
-    last = df.iloc[-1]
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("CVD_z (last)", f"{last['cvd_z']:.2f}" if np.isfinite(last['cvd_z']) else "nan")
-    c2.metric("TS_z (last)",  f"{last['ts_z']:.2f}"  if np.isfinite(last['ts_z'])  else "nan")
-    c3.metric("Action", str(last.get("action", "")))
-    c4.metric("Grid",   str(last.get("grid_candidate", "")))
-    mid_val = last.get("mid", np.nan)
-    c5.metric("Mid Price", f"{mid_val:.6f}" if np.isfinite(mid_val) else "nan")
+    ensure_dirs()
+    with open(path, "a", encoding="utf-8") as f:
+        for ln in lines:
+            f.write(ln if ln.endswith("\n") else ln + "\n")
 
-show_metrics(df)
-
-# ========== Charts (เฉพาะ cvd_z & ts_z — ไม่มีกราฟ mid price) ==========
-def chart_z(df: pd.DataFrame, z_col: str, th: float, title: str):
-    base = alt.Chart(df).encode(
-        x=alt.X("time:T", title=None)
+def make_proc(cmd):
+    # ใช้ interpreter ตัวเดียวกับที่รัน Streamlit
+    return subprocess.Popen(
+        [sys.executable, "-u", cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        universal_newlines=True,
+        cwd=os.getcwd(),
+        env=os.environ.copy()
     )
-    line = base.mark_line().encode(
-        y=alt.Y(f"{z_col}:Q", title=title),
-        tooltip=[
-            "time:T",
-            alt.Tooltip(f"{z_col}:Q", format=".2f"),
-            "action:N", "dq:N", "confirm_count:Q"
-        ],
-    )
-    th_df = pd.DataFrame({"th":[th]})
-    rule = alt.Chart(th_df).mark_rule(strokeDash=[4,3]).encode(y="th:Q")
 
-    # ไฮไลต์จุดที่ action == PLACE_BUY
-    buys = base.transform_filter(alt.datum.action == "PLACE_BUY") \
-               .mark_point(size=70, filled=True, shape="triangle-up") \
-               .encode(y=f"{z_col}:Q")
+def reader_thread(stream, q: queue.Queue, tag: str):
+    # อ่านบรรทัดต่อบรรทัดแล้วโยนเข้าคิว (ไม่บล็อค UI)
+    for line in iter(stream.readline, ""):
+        q.put((tag, line))
+    stream.close()
 
-    return (line + rule + buys).properties(height=280)
+def init_session_state():
+    ss = st.session_state
+    if "bot_proc" not in ss:
+        ss.bot_proc = None
+    if "stdout_thr" not in ss:
+        ss.stdout_thr = None
+    if "stderr_thr" not in ss:
+        ss.stderr_thr = None
+    if "log_q" not in ss:
+        ss.log_q = queue.Queue()
+    if "errors" not in ss:
+        ss.errors = deque(maxlen=DEFAULT_MAX_KEEP)
+    if "last_flush_ts" not in ss:
+        ss.last_flush_ts = 0.0
+    if "attach_bang" not in ss:
+        ss.attach_bang = False
 
-if not df.empty:
-    col1, col2 = st.columns(2)
-    with col1:
-        safe_altair_chart(chart_z(df, "cvd_z", cvd_z_th, "CVD z-score"))
-    with col2:
-        safe_altair_chart(chart_z(df, "ts_z",  ts_z_th,  "Trade Size z-score"))
+def is_running():
+    return (st.session_state.bot_proc is not None) and (st.session_state.bot_proc.poll() is None)
 
-# ========== Table ==========
-if not df.empty:
-    table_df = (
-        df[["time","dq","mid","cvd_z","ts_z","confirm_count",
-            "buy_signal_confirmed","grid_candidate","action","reason"]]
-        .rename(columns={"time":"UTC time"})
-    )
+def start_bot(bot_path: str):
+    if is_running():
+        return
+    if not os.path.exists(bot_path):
+        st.error(f"ไม่พบไฟล์บอท: {bot_path}")
+        return
+    ensure_dirs()
+    proc = make_proc(bot_path)
+    st.session_state.bot_proc = proc
+
+    # สร้างเธรดอ่าน stdout/stderr
+    out_thr = threading.Thread(target=reader_thread, args=(proc.stdout, st.session_state.log_q, "STDOUT"), daemon=True)
+    err_thr = threading.Thread(target=reader_thread, args=(proc.stderr, st.session_state.log_q, "STDERR"), daemon=True)
+    out_thr.start(); err_thr.start()
+    st.session_state.stdout_thr = out_thr
+    st.session_state.stderr_thr = err_thr
+
+def stop_bot():
+    proc = st.session_state.bot_proc
+    if proc is None:
+        return
     try:
-        st.dataframe(table_df, width="stretch", height=360)
-    except TypeError:
-        st.dataframe(table_df, use_container_width=True, height=360)
-else:
-    st.info(f"ยังไม่พบไฟล์หรือไม่มีข้อมูล: {csv_path}")
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except Exception:
+        pass
+    st.session_state.bot_proc = None
+    st.session_state.stdout_thr = None
+    st.session_state.stderr_thr = None
 
-# ========== Auto-refresh ==========
-time.sleep(refresh_sec)
-try:
-    st.rerun()
-except Exception:
-    st.experimental_rerun()
+ERR_RE = re.compile(r"^\[(ERR)\]\s*(.*)")
+BANG_RE = re.compile(r"^\[\!\]\s*(.*)")  # optional important warning
+
+def pump_queue(include_bang: bool) -> int:
+    """ดึงข้อความจากคิว → เก็บเฉพาะ error (และ [!] ถ้าเลือก) → เขียนลงไฟล์ errors_only.log"""
+    collected = []
+    pushed = 0
+    while True:
+        try:
+            tag, line = st.session_state.log_q.get_nowait()
+        except queue.Empty:
+            break
+        line_stripped = line.rstrip("\n")
+        m_err = ERR_RE.match(line_stripped)
+        if m_err:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pretty = f"[{ts}] [ERR] {m_err.group(2)}"
+            st.session_state.errors.append(pretty)
+            collected.append(pretty)
+            pushed += 1
+            continue
+        if include_bang:
+            m_bang = BANG_RE.match(line_stripped)
+            if m_bang:
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                pretty = f"[{ts}] [!] {m_bang.group(1)}"
+                st.session_state.errors.append(pretty)
+                collected.append(pretty)
+                pushed += 1
+    if collected:
+        tail_write(ERRORS_ONLY_LOG, collected)
+    return pushed
+
+def clear_errors():
+    st.session_state.errors.clear()
+    # ล้างไฟล์ด้วย
+    try:
+        if os.path.exists(ERRORS_ONLY_LOG):
+            os.remove(ERRORS_ONLY_LOG)
+    except Exception:
+        pass
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="Grid Bot Errors", page_icon="🚨", layout="wide")
+init_session_state()
+
+st.title("🚨 Grid Bot — Errors Monitor (errors only)")
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    bot_path = st.text_input("Bot script path", DEFAULT_BOT_PATH)
+    refresh_ms = st.slider("Auto-refresh (ms)", min_value=1000, max_value=10000, value=DEFAULT_REFRESH_MS, step=500)
+    include_bang = st.toggle("Include important [!]", value=st.session_state.attach_bang, help="รวมบรรทัดที่ขึ้นต้นด้วย [!]")
+    st.session_state.attach_bang = include_bang
+
+    colb1, colb2 = st.columns(2)
+    with colb1:
+        if st.button("▶️ Start bot", use_container_width=True, disabled=is_running()):
+            start_bot(bot_path)
+    with colb2:
+        if st.button("⏹ Stop bot", use_container_width=True, disabled=not is_running()):
+            stop_bot()
+
+    st.divider()
+    if st.button("🧹 Clear errors", use_container_width=True):
+        clear_errors()
+    # ปุ่มดาวน์โหลด errors
+    errors_txt = "\n".join(st.session_state.errors)
+    st.download_button("📥 Download errors.txt", errors_txt, file_name="errors.txt", mime="text/plain", use_container_width=True)
+
+# ดึงข้อความใหม่จากคิว (เฉพาะ error)
+new_cnt = pump_queue(include_bang)
+
+# แสดงสถานะบอท
+st.markdown(
+    f"**Bot status:** {'🟢 Running' if is_running() else '🔴 Stopped'}  "
+    f"| **Errors shown:** {len(st.session_state.errors):,}  "
+    f"{'| newly captured: ' + str(new_cnt) if new_cnt else ''}"
+)
+
+# พื้นที่แสดง errors — ล่าสุดไว้บน
+with st.container(border=True):
+    st.subheader("Errors")
+    if st.session_state.errors:
+        # แสดง N รายการล่าสุด (กลับด้าน)
+        for ln in list(st.session_state.errors)[-1000:][::-1]:
+            st.code(ln, language=None)
+    else:
+        st.info("ยังไม่พบบรรทัดที่ขึ้นต้นด้วย [ERR] (หรือ [!] ถ้าเปิดตัวเลือก)")
+
+# Auto-refresh
+st.experimental_set_query_params(refresh=str(time.time()))  # กัน cache บางกรณี
+st.autorefresh = st.experimental_rerun  # just alias for readability
+# ใช้ st_autorefresh เพื่อเรียกสคริปต์ใหม่อัตโนมัติ
+st.experimental_memo.clear() if False else None  # placeholder no-op
+st.experimental_singleton.clear() if False else None  # placeholder no-op
+st.stop() if False else None  # placeholder no-op
+
+# ออโต้รีเฟรชแบบเบา ๆ
+st.runtime.legacy_caching.clear_cache() if False else None  # no-op
+st.experimental_set_query_params(_=str(int(time.time()*1000)))  # tick param
+st.experimental_rerun() if st.session_state.get("_autorefresh_tick") and False else None
+# ใช้กลไกของ Streamlit: autorefresh component
+st.empty()
+st.experimental_data_editor if False else None  # keep linter quiet
+# ใช้ built-in autorefresh
+st_autorefresh = st.sidebar.empty()
+st_autorefresh.html(f"""<script>
+setTimeout(function() {{ window.location.reload(); }}, {int(refresh_ms)});
+</script>""", height=0)
