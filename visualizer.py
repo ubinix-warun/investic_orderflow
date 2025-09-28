@@ -1,212 +1,112 @@
 # visualizer.py
-import streamlit as st
-import subprocess, threading, queue, sys, os, time, re
+import os
+from glob import glob
 from collections import deque
-from datetime import datetime
+import streamlit as st
+from streamlit.components.v1 import html
 
-# =========================
-# Settings (ปรับได้จาก UI)
-# =========================
-DEFAULT_BOT_PATH = "grid_bot.py"
-DEFAULT_REFRESH_MS = 3000
-DEFAULT_MAX_KEEP = 5000
-DEFAULT_LOG_DIR = "logs"
-ERRORS_ONLY_LOG = os.path.join(DEFAULT_LOG_DIR, "errors_only.log")
+# --------------------
+# Config (ปรับค่าตามต้องการ)
+# --------------------
+DEFAULT_LOG_DIR   = "logs"     # โฟลเดอร์ที่มีไฟล์ .log/.txt
+ERROR_MAX_BYTES   = 300_000    # อ่านเฉพาะท้ายไฟล์ ~300KB/ไฟล์
+ERROR_SHOW_MAX    = 300        # แสดง error ล่าสุดไม่เกิน N บรรทัด
+DEFAULT_REFRESHMS = 3000       # ms
 
-# =========================
-# Utilities
-# =========================
-def ensure_dirs():
-    os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
+ERROR_PREFIX = "[ERR]"         # เอาเฉพาะ error ตามที่ขอ
 
-def tail_write(path: str, lines: list[str]):
-    if not lines:
-        return
-    ensure_dirs()
-    with open(path, "a", encoding="utf-8") as f:
-        for ln in lines:
-            f.write(ln if ln.endswith("\n") else ln + "\n")
+st.set_page_config(page_title="Grid Dashboard + Errors", page_icon="🚨", layout="wide")
 
-def make_proc(cmd):
-    # ใช้ interpreter ตัวเดียวกับที่รัน Streamlit
-    return subprocess.Popen(
-        [sys.executable, "-u", cmd],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-        universal_newlines=True,
-        cwd=os.getcwd(),
-        env=os.environ.copy()
-    )
-
-def reader_thread(stream, q: queue.Queue, tag: str):
-    # อ่านบรรทัดต่อบรรทัดแล้วโยนเข้าคิว (ไม่บล็อค UI)
-    for line in iter(stream.readline, ""):
-        q.put((tag, line))
-    stream.close()
-
-def init_session_state():
-    ss = st.session_state
-    if "bot_proc" not in ss:
-        ss.bot_proc = None
-    if "stdout_thr" not in ss:
-        ss.stdout_thr = None
-    if "stderr_thr" not in ss:
-        ss.stderr_thr = None
-    if "log_q" not in ss:
-        ss.log_q = queue.Queue()
-    if "errors" not in ss:
-        ss.errors = deque(maxlen=DEFAULT_MAX_KEEP)
-    if "last_flush_ts" not in ss:
-        ss.last_flush_ts = 0.0
-    if "attach_bang" not in ss:
-        ss.attach_bang = False
-
-def is_running():
-    return (st.session_state.bot_proc is not None) and (st.session_state.bot_proc.poll() is None)
-
-def start_bot(bot_path: str):
-    if is_running():
-        return
-    if not os.path.exists(bot_path):
-        st.error(f"ไม่พบไฟล์บอท: {bot_path}")
-        return
-    ensure_dirs()
-    proc = make_proc(bot_path)
-    st.session_state.bot_proc = proc
-
-    # สร้างเธรดอ่าน stdout/stderr
-    out_thr = threading.Thread(target=reader_thread, args=(proc.stdout, st.session_state.log_q, "STDOUT"), daemon=True)
-    err_thr = threading.Thread(target=reader_thread, args=(proc.stderr, st.session_state.log_q, "STDERR"), daemon=True)
-    out_thr.start(); err_thr.start()
-    st.session_state.stdout_thr = out_thr
-    st.session_state.stderr_thr = err_thr
-
-def stop_bot():
-    proc = st.session_state.bot_proc
-    if proc is None:
-        return
+# --------------------
+# Helpers
+# --------------------
+def _find_latest_logs(dirpath: str) -> list[str]:
     try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        files = []
+        for patt in ("*.log", "*.txt"):
+            files.extend(glob(os.path.join(dirpath, patt)))
+        files = [p for p in files if os.path.isfile(p)]
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return files[:5]  # พอให้ครอบคลุมหลายไฟล์ล่าสุด
     except Exception:
-        pass
-    st.session_state.bot_proc = None
-    st.session_state.stdout_thr = None
-    st.session_state.stderr_thr = None
+        return []
 
-ERR_RE = re.compile(r"^\[(ERR)\]\s*(.*)")
-BANG_RE = re.compile(r"^\[\!\]\s*(.*)")  # optional important warning
+def _tail_text(path: str, max_bytes: int = ERROR_MAX_BYTES) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes), os.SEEK_SET)
+            chunk = f.read()
+        return chunk.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
 
-def pump_queue(include_bang: bool) -> int:
-    """ดึงข้อความจากคิว → เก็บเฉพาะ error (และ [!] ถ้าเลือก) → เขียนลงไฟล์ errors_only.log"""
-    collected = []
-    pushed = 0
-    while True:
-        try:
-            tag, line = st.session_state.log_q.get_nowait()
-        except queue.Empty:
-            break
-        line_stripped = line.rstrip("\n")
-        m_err = ERR_RE.match(line_stripped)
-        if m_err:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            pretty = f"[{ts}] [ERR] {m_err.group(2)}"
-            st.session_state.errors.append(pretty)
-            collected.append(pretty)
-            pushed += 1
+def _extract_errors(text: str) -> list[str]:
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith(ERROR_PREFIX):
+            out.append(s)
+    return out
+
+def _collect_errors(log_dir: str) -> list[str]:
+    errors: list[str] = []
+    for p in _find_latest_logs(log_dir):
+        txt = _tail_text(p, ERROR_MAX_BYTES)
+        if not txt:
             continue
-        if include_bang:
-            m_bang = BANG_RE.match(line_stripped)
-            if m_bang:
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                pretty = f"[{ts}] [!] {m_bang.group(1)}"
-                st.session_state.errors.append(pretty)
-                collected.append(pretty)
-                pushed += 1
-    if collected:
-        tail_write(ERRORS_ONLY_LOG, collected)
-    return pushed
+        errors.extend(_extract_errors(txt))
+    # dedupe แบบรักษาลำดับ
+    seen = set()
+    dq = deque(maxlen=ERROR_SHOW_MAX)
+    for ln in errors:
+        if ln in seen:
+            continue
+        seen.add(ln)
+        dq.append(ln)
+    return list(dq)[-ERROR_SHOW_MAX:]
 
-def clear_errors():
-    st.session_state.errors.clear()
-    # ล้างไฟล์ด้วย
-    try:
-        if os.path.exists(ERRORS_ONLY_LOG):
-            os.remove(ERRORS_ONLY_LOG)
-    except Exception:
-        pass
+# Cache บาง ๆ ลด IO (TTL 2s)
+@st.cache_data(ttl=2)
+def get_errors_cached(log_dir: str) -> list[str]:
+    return _collect_errors(log_dir)
 
-# =========================
-# Streamlit UI
-# =========================
-st.set_page_config(page_title="Grid Bot Errors", page_icon="🚨", layout="wide")
-init_session_state()
-
-st.title("🚨 Grid Bot — Errors Monitor (errors only)")
-
+# --------------------
+# Sidebar controls (เบาที่สุด)
+# --------------------
 with st.sidebar:
     st.header("⚙️ Settings")
-    bot_path = st.text_input("Bot script path", DEFAULT_BOT_PATH)
-    refresh_ms = st.slider("Auto-refresh (ms)", min_value=1000, max_value=10000, value=DEFAULT_REFRESH_MS, step=500)
-    include_bang = st.toggle("Include important [!]", value=st.session_state.attach_bang, help="รวมบรรทัดที่ขึ้นต้นด้วย [!]")
-    st.session_state.attach_bang = include_bang
+    log_dir = st.text_input("Log folder", DEFAULT_LOG_DIR)
+    refresh_ms = st.slider("Auto-refresh (ms)", 1000, 10000, DEFAULT_REFRESHMS, 500)
 
-    colb1, colb2 = st.columns(2)
-    with colb1:
-        if st.button("▶️ Start bot", use_container_width=True, disabled=is_running()):
-            start_bot(bot_path)
-    with colb2:
-        if st.button("⏹ Stop bot", use_container_width=True, disabled=not is_running()):
-            stop_bot()
+# --------------------
+# (ที่นี่คือพื้นที่กราฟ/แดชบอร์ดเดิมของคุณ)
+# วางโค้ดกราฟเดิมต่อไปตามปกติ...
+# --------------------
 
-    st.divider()
-    if st.button("🧹 Clear errors", use_container_width=True):
-        clear_errors()
-    # ปุ่มดาวน์โหลด errors
-    errors_txt = "\n".join(st.session_state.errors)
-    st.download_button("📥 Download errors.txt", errors_txt, file_name="errors.txt", mime="text/plain", use_container_width=True)
-
-# ดึงข้อความใหม่จากคิว (เฉพาะ error)
-new_cnt = pump_queue(include_bang)
-
-# แสดงสถานะบอท
-st.markdown(
-    f"**Bot status:** {'🟢 Running' if is_running() else '🔴 Stopped'}  "
-    f"| **Errors shown:** {len(st.session_state.errors):,}  "
-    f"{'| newly captured: ' + str(new_cnt) if new_cnt else ''}"
-)
-
-# พื้นที่แสดง errors — ล่าสุดไว้บน
-with st.container(border=True):
-    st.subheader("Errors")
-    if st.session_state.errors:
-        # แสดง N รายการล่าสุด (กลับด้าน)
-        for ln in list(st.session_state.errors)[-1000:][::-1]:
+# --------------------
+# Errors panel
+# --------------------
+st.markdown("### 🚨 Errors (latest)")
+try:
+    errs = get_errors_cached(log_dir)
+    if errs:
+        # แสดงล่าสุดไว้บน
+        for ln in errs[::-1]:
             st.code(ln, language=None)
     else:
-        st.info("ยังไม่พบบรรทัดที่ขึ้นต้นด้วย [ERR] (หรือ [!] ถ้าเปิดตัวเลือก)")
+        st.info(f"ยังไม่พบบรรทัดที่ขึ้นต้นด้วย [ERR] ในโฟลเดอร์ `{log_dir}/`")
+except Exception as e:
+    st.warning(f"แสดง error ไม่สำเร็จ: {e}")
 
-# Auto-refresh
-st.experimental_set_query_params(refresh=str(time.time()))  # กัน cache บางกรณี
-st.autorefresh = st.experimental_rerun  # just alias for readability
-# ใช้ st_autorefresh เพื่อเรียกสคริปต์ใหม่อัตโนมัติ
-st.experimental_memo.clear() if False else None  # placeholder no-op
-st.experimental_singleton.clear() if False else None  # placeholder no-op
-st.stop() if False else None  # placeholder no-op
-
-# ออโต้รีเฟรชแบบเบา ๆ
-st.runtime.legacy_caching.clear_cache() if False else None  # no-op
-st.experimental_set_query_params(_=str(int(time.time()*1000)))  # tick param
-st.experimental_rerun() if st.session_state.get("_autorefresh_tick") and False else None
-# ใช้กลไกของ Streamlit: autorefresh component
-st.empty()
-st.experimental_data_editor if False else None  # keep linter quiet
-# ใช้ built-in autorefresh
-st_autorefresh = st.sidebar.empty()
-st_autorefresh.html(f"""<script>
-setTimeout(function() {{ window.location.reload(); }}, {int(refresh_ms)});
-</script>""", height=0)
+# --------------------
+# Auto refresh (เสถียร/เรียบง่าย)
+# --------------------
+html(f"""
+<script>
+setTimeout(function() {{
+    window.location.reload();
+}}, {int(refresh_ms)});
+</script>
+""", height=0)
