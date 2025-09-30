@@ -3,17 +3,35 @@
 
 import os, sys
 import ccxt
+from typing import Tuple, Optional
 
+def _load_api_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """Load API credentials with error handling"""
+    try:
+        from api_config import get_api_credentials
+        api_key, api_secret = get_api_credentials()
+        
+        if not api_key or not api_secret:
+            print("❌ API credentials not configured!")
+            print("Please update api_config.py with your Binance API credentials")
+            return None, None
+        else:
+            print("✅ API credentials loaded successfully")
+            return api_key, api_secret
+            
+    except ImportError:
+        print("⚠️  api_config.py not found, running without API credentials")
+        return None, None
+    
 def main():
-    key = os.getenv("BN_API_KEY")
-    sec = os.getenv("BN_API_SECRET")
-    if not key or not sec:
-        print("กรุณา export BINANCE_KEY และ BINANCE_SECRET ก่อนรันสคริปต์", file=sys.stderr)
+    api_key, api_secret = _load_api_credentials()
+    if not api_key or not api_secret:
+        print("กรุณา export BN_API_KEY และ BN_API_SECRET ก่อนรันสคริปต์", file=sys.stderr)
         sys.exit(1)
 
     ex = ccxt.binance({
-        "apiKey": key,
-        "secret": sec,
+        "apiKey": api_key,
+        "secret": api_secret,
         "enableRateLimit": True,
         "options": {"adjustForTimeDifference": True, "defaultType": "spot"},
     })

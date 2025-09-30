@@ -217,13 +217,32 @@ def init_csv_logger(path: str):
 
 # ===================== DATA FETCHER =====================
 
+def _load_api_credentials() -> Tuple[Optional[str], Optional[str]]:
+    """Load API credentials with error handling"""
+    try:
+        from api_config import get_api_credentials
+        api_key, api_secret = get_api_credentials()
+        
+        if not api_key or not api_secret:
+            print("❌ API credentials not configured!")
+            print("Please update api_config.py with your Binance API credentials")
+            return None, None
+        else:
+            print("✅ API credentials loaded successfully")
+            return api_key, api_secret
+            
+    except ImportError:
+        print("⚠️  api_config.py not found, running without API credentials")
+        return None, None
+    
 class DataFetcher:
     def __init__(self, symbol: str, exchange_id: str = "binance", with_auth: bool = False):
         self.symbol = symbol
+        api_key, api_secret = _load_api_credentials()
         kwargs = {"enableRateLimit": True}
         if with_auth:
-            kwargs["apiKey"] = os.getenv("BINANCE_KEY", "")
-            kwargs["secret"] = os.getenv("BINANCE_SECRET", "")
+            kwargs["apiKey"] = api_key
+            kwargs["secret"] = api_secret
         self.exchange = getattr(ccxt, exchange_id)(kwargs)
         self.exchange.load_markets()
         self._imbalance_ema: Optional[float] = None
