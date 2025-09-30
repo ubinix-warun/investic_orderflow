@@ -1,0 +1,8 @@
+macOS
+- System Settings → General → Date & Time → เปิด Set time and date automatically
+Windows
+- Start → Settings → Time & Language → Date & time
+- เปิด Set time automatically และ Set time zone automatically
+- กด Sync now (อยู่ใต้ Additional settings → Additional clocks บางเวอร์ชันจะมีปุ่ม Sync now อยู่หน้า Date & time เลย)
+
+เสร็จแล้วปิด-เปิดบอท 1 ครั้ง
