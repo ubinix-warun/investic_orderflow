@@ -5,8 +5,8 @@ import os, sys
 import ccxt
 
 def main():
-    key = os.getenv("BINANCE_KEY")
-    sec = os.getenv("BINANCE_SECRET")
+    key = os.getenv("BN_API_KEY")
+    sec = os.getenv("BN_API_SECRET")
     if not key or not sec:
         print("กรุณา export BINANCE_KEY และ BINANCE_SECRET ก่อนรันสคริปต์", file=sys.stderr)
         sys.exit(1)
