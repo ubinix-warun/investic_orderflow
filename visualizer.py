@@ -7,7 +7,8 @@ import altair as alt
 import streamlit as st
 
 # ========== Page setup ==========
-DEFAULT_SYMBOL = "XRP/USDT"
+# DEFAULT_SYMBOL = "XRP/USDT"
+DEFAULT_SYMBOL = "JTO/USDT"
 DEFAULT_LOG_DIR = "logs"
 
 st.set_page_config(page_title="CVD_z & TS_z Monitor", layout="wide")
