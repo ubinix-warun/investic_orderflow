@@ -781,6 +781,60 @@ class ExecutionLayer:
             ref = float(grid_df.loc[i, "buy_price"]); tol = self._price_tol(ref)
             return float(ref) if abs(ref - px) <= tol else None
 
+    # ---------- pre-lock existing open orders ----------
+    def prelock_existing(self, engine: "SignalEngine", grid_df: pd.DataFrame) -> None:
+        """
+        อ่าน open orders จากเอ็กซ์เชนจ์ แล้ว map → level เพื่อ:
+          - set engine.open_orders_count = จำนวน SELL (TP) ที่ค้างจริง
+          - เติม self.buy_ids / self.tp_ids
+          - ใส่ engine.active_levels ให้ตรงกับของจริง
+        """
+        try:
+            oo = self.ex.fetch_open_orders(self.symbol)
+        except Exception:
+            oo = []
+
+        buys = sells = locked = 0
+
+        # จำนวนดีลเปิดจริง = นับ SELL ที่ค้าง (TP)
+        exchange_sells = sum(1 for o in oo if (o.get("side") or "").lower() == "sell")
+        engine.open_orders_count = exchange_sells
+
+        for o in oo:
+            px = float(o.get("price") or 0.0)
+            side = (o.get("side") or "").lower()
+
+            lv = self.level_key_from_order(grid_df, px, side)
+
+            # debug: SELL ที่หา level ไม่เจอ
+            if lv is None:
+                if side == "sell" and SHOW_UNMAPPED_SELL_DEBUG:
+                    try:
+                        if ("tp_price" in grid_df.columns) and (len(grid_df) > 0):
+                            nearest_idx = (grid_df["tp_price"] - px).abs().idxmin()
+                            nearest_tp = float(grid_df.loc[nearest_idx, "tp_price"])
+                            tick = self.tick_size or 1e-8
+                            diff_pct = abs(px - nearest_tp) / max(nearest_tp, 1e-9) * 100.0
+                            ticks = abs(px - nearest_tp) / max(tick, 1e-12)
+                            tol_abs = (LOCK_TOL * nearest_tp)
+                            print(f"[d] unmapped SELL px={px} vs nearest tp={nearest_tp}  Δ={diff_pct:.3f}% (~{ticks:.1f} ticks)  tol≈{tol_abs}")
+                    except Exception:
+                        pass
+                continue
+
+            engine.active_levels.add(lv); locked += 1
+            if side == "buy":
+                self.buy_ids[lv] = o.get("id"); buys += 1
+            elif side == "sell":
+                self.tp_ids[lv]  = o.get("id"); sells += 1
+
+        if SHOW_PRELOCK_SUMMARY and (buys or sells or locked):
+            print(
+                f"[i] pre-locked {locked} level(s) from open orders (buy={buys}, sell={sells}). "
+                f"open_deals={engine.open_orders_count}"
+            )
+
+
 # ===================== MAIN =====================
 def main() -> None:
     print("[i] เริ่มดึงข้อมูลสดจาก Binance …")
