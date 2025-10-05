@@ -963,3 +963,13 @@ def main() -> None:
             csv_fh.close()
         except Exception:
             pass
+
+# --- entrypoint ---
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"[FATAL] {type(e).__name__}: {e}")
+        traceback.print_exc()
+
