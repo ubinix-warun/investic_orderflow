@@ -8,32 +8,12 @@ Live 5s bars + Signal + Grid Execution (Spot Binance, ccxt)
 - กันเปิดซ้ำระดับ: pre-lock จาก open orders, ตรวจซ้ำก่อนยิง, map order→level
 - BUY = MARKET 100% แล้ววาง TP เป็น LIMIT SELL ทันที
 
-แพตช์/ฮาร์เดน:
-  [API load]
-    - ลด BOOK_LIMIT เหลือ 20 (พอสำหรับ top-of-book/depth 5)
-    - ลดความถี่ fetch_recent_trades เป็นทุก ~1.2s
-    - poll open orders แบบเว้นช่วง และตรวจสถานะรายออเดอร์ (closed/canceled)
-
-  [ความถูกต้อง]
-    - ดักดีดู้พเทรดด้วย timestamp+id (ไม่เทียบ id เป็นสตริงล้วน)
-    - newOrderRespType='FULL' เพื่อได้ average/fills จาก MARKET BUY
-    - rounding ด้วย Decimal (ceil/floor ตาม tick & lot) กัน float เพี้ยน
-
-  [กติกา exchange]
-    - min_notional ใช้ max(ค่าจากตลาด, MIN_NOTIONAL_OVERRIDE) (ไม่ลดต่ำกว่าค่าจริง)
-    - TP ขั้นต่ำ = max(row_tp, fill_avg*(1+2*fee+extra), tp_need_from_minNotional)
-    - ราคา TP ฝั่งขายปัดขึ้นตาม tick, จำนวนขายปัดลงตาม LOT_SIZE
-    - กัน TP ต่ำเกิน bid ด้วย best_bid* (1+TP_BID_SAFETY_PCT)
-
-  [UX/เสถียรภาพ]
-    - pre-lock เฉพาะกรณีราคาเปิดใกล้ buy_price จริง (ไม่ปัด floor เป็นคีย์อื่น)
-    - try/finally ปิด CSV เมื่อ Ctrl-C
-
-  [FIX บั๊กสำคัญ]
-    - _pick_grid_candidate() คืนเฉพาะเลเวลที่ “ใกล้กริดจริง” เท่านั้น (ตัด fallback)
-    - update(): within_tol = ระยะห่างกับ mid ≤ GRID_TOL (ไม่ใช่แค่ candidate != None)
-    - ก่อนยิงคำสั่ง ตรวจ CSV row และความใกล้กริดอีกครั้ง ถ้าไม่ผ่าน → skip
-    - prelock_existing(): แม็พ SELL (TP) ด้วย tp_price แล้วตั้ง open_orders_count จาก TP ที่ค้าง
+อัปเดตสำคัญ (insufficient fix + dust tracker + debug):
+  • BUY ใช้ quoteOrderQty (ยอด USDT) เสมอ → ไม่ติด LOT_SIZE/minQty/minNotional ฝั่งซื้อ
+  • คำนวณงบขั้นต่ำ = max(coin_size*px_ref, minNotional) + safety buffer แล้วปัดลงเป็นหน่วยเซ็นต์
+  • ใส่ newOrderRespType='FULL' และ avg = cost/filled ถ้ามีข้อมูล
+  • Dust tracker: บันทึกเศษลง dust_ledger.csv สำหรับ lot_rounding/minQty_gate/minNotional_gate/tp_place_failed
+  • debug: [buy-debug], [tp-debug], และข้อความ skip ที่อธิบายเหตุผล
 """
 
 import csv
@@ -48,61 +28,51 @@ from typing import Optional, List, Dict, Set, Tuple
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING, getcontext
 
-# ตั้ง precision ของ Decimal ให้พอสำหรับคริปโต
+# ===================== CONFIG =====================
 getcontext().prec = 28
 def _q(x) -> Decimal: return Decimal(str(x))
 
-# ===================== CONFIG =====================
+EXCHANGE_ID = "binance"
 
-EXCHANGE_ID = "binance"     # ชื่อเอ็กซ์เชนจ์ใน ccxt
+BOOK_LIMIT = 20
+BAR_MS = 5_000
+EMA_SPAN = 10
 
-BOOK_LIMIT = 20             # ความลึกของ OrderBook ที่ดึงต่อรอบ (พอสำหรับ top-of-book)
-BAR_MS = 5_000              # 1 บาร์ = 5 วินาที
-EMA_SPAN = 10               # EMA span ของ order_imbalance
-
-GRID_TOL = 0.005            # ใกล้กริด: abs(mid - level)/level ≤ 0.5%
-LOCK_TOL = 0.0015           # แมตช์ออเดอร์เปิด ↔ ระดับกริดเพื่อ “ล็อก” เลเวล
-
-# FIX: ปิด fallback เองตามดีฟอลต์ (เพื่อไม่ให้ยิงตอนห่างกริด)
+GRID_TOL = 0.002
+LOCK_TOL = 0.0015
 ALLOW_FALLBACK_EXEC = False
 
-CONFIRM_BARS = 1            # ต้องติด raw-signal กี่แท่งถึงยืนยัน
-COOLDOWN_MS = 60_000        # คูลดาวน์หลัง BUY สำเร็จ
+CONFIRM_BARS = 1
+COOLDOWN_MS = 60_000
 
-# z-score threshold
-WINDOW = 50                 # ขนาดหน้าต่างย้อนหลัง
-CVD_Z_TH = 2
+WINDOW = 50
+CVD_Z_TH = 1.5
 TS_Z_TH  = 1.5
 
-MAX_OPEN_ORDERS = 10        # จำกัดดีลเปิดพร้อมกันสูงสุด
+MAX_OPEN_ORDERS = 30
+GRID_CSV = "grid_plan.csv"
+GRID_RELOAD_SEC = 0
 
-GRID_CSV = "grid_plan.csv"  # ไฟล์กริด (ต้องมี buy_price, coin_size, tp_price/tp_pct)
-GRID_RELOAD_SEC = 0         # รีโหลดกริดอัตโนมัติทุก N วินาที (0=ปิด)
+DRY_RUN = False
 
-DRY_RUN = False             # True = โหมดเดโม, False = ส่งออเดอร์จริง
+MIN_NOTIONAL_OVERRIDE = None
+SLIP_PCT = 0.0007
 
-MIN_NOTIONAL_OVERRIDE = None   # ไม่ลดต่ำกว่าค่าจริง: ใช้ max(ค่าจากตลาด, override); ตั้ง None เพื่อใช้ค่าจากตลาดล้วน
-SLIP_PCT = 0.0007           # buffer คำนวณจำนวนเหรียญขั้นต่ำ: ใช้ best_ask*(1+SLIP_PCT)
+EXEC_FEE_RATE = 0.0004
+TP_EXTRA_MARGIN = 0.0005
+TP_BID_SAFETY_PCT = 0.0001
 
-# >>> ความปลอดภัย TP <<<
-EXEC_FEE_RATE = 0.0004      # 0.04% ต่อข้าง (ใช้ในการยก TP ให้พ้นค่าธรรมเนียม)
-TP_EXTRA_MARGIN = 0.0005    # กันเผื่อจากฟิลจริง +0.05% (ปรับได้)
-TP_BID_SAFETY_PCT = 0.0001  # 0.01% กัน TP ต่ำกว่าบิดมากไปจนโดนรับทันที
+TRADES_POLL_MS = 1200
+POLL_OPEN_ORDERS_SEC = 3.0
+RESYNC_OPEN_ORDERS_SEC = 60
 
-# Poll/Throttle
-TRADES_POLL_MS = 1200       # ดึง recent trades อย่างน้อยทุก 1.2s
-POLL_OPEN_ORDERS_SEC = 3.0  # โพลล์สถานะ TP รายออเดอร์ทุก 3 วินาที
+SHOW_PRELOCK_SUMMARY = False
+SHOW_UNMAPPED_SELL_DEBUG = False
 
-# resync actual orders
-RESYNC_OPEN_ORDERS_SEC = 60  # 0=ปิด
-
-# =============== LOGGING SWITCHES ===============
-SHOW_PRELOCK_SUMMARY = False      # ปิดสรุป pre-locked (บรรทัดยาวชวนงง)
-SHOW_UNMAPPED_SELL_DEBUG = False  # ปิด debug unmapped SELL ... Δ=... ticks
-
+# Dust ledger
+DUST_LEDGER_FILE = "dust_ledger.csv"
 
 # ===================== UTILS =====================
-
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -113,19 +83,16 @@ def ema_update(prev: Optional[float], x: float, span: int) -> float:
     return (1 - alpha) * prev + alpha * x
 
 def sf(x, nd=5) -> str:
-    """safe format: คืน 'nan' ถ้า x ไม่ใช่ตัวเลขปกติ"""
     try:
         v = float(x)
-        if not np.isfinite(v):
-            return "nan"
+        if not np.isfinite(v): return "nan"
         return f"{v:.{nd}f}"
     except Exception:
         return "nan"
 
 def _normalize_symbol(raw: str) -> str:
     s = (raw or "").strip().upper().replace("\\", "/").replace("-", "/")
-    if not s:
-        return s
+    if not s: return s
     if "/" in s:
         base, quote = s.split("/", 1)
         base = base.strip()
@@ -137,20 +104,10 @@ def _normalize_symbol(raw: str) -> str:
     return f"{s}/USDT"
 
 def detect_symbol_from_macro(macro_csv: str = "macro_montecarlo.csv") -> str:
-    """
-    อ่านคอลัมน์ 'symbol' จากไฟล์ macro_montecarlo.csv (แถวสรุปสุดท้าย)
-    แล้ว normalize ให้อยู่รูป BASE/QUOTE เช่น XRP/USDT
-    """
-    try:
-        df = pd.read_csv(macro_csv)
-    except Exception as e:
-        raise RuntimeError(f"อ่านไฟล์ {macro_csv} ไม่ได้: {e}")
-    if "symbol" not in df.columns:
-        raise RuntimeError(f"ไม่พบคอลัมน์ 'symbol' ใน {macro_csv}")
-    series = df["symbol"].dropna().astype(str)
-    if series.empty:
-        raise RuntimeError(f"คอลัมน์ 'symbol' ใน {macro_csv} ว่างเปล่า")
-    return _normalize_symbol(series.iloc[-1])
+    df = pd.read_csv(macro_csv)
+    if "symbol" not in df.columns or df["symbol"].dropna().empty:
+        raise RuntimeError("อ่าน symbol จาก macro_montecarlo.csv ไม่ได้")
+    return _normalize_symbol(df["symbol"].dropna().astype(str).iloc[-1])
 
 def load_grid_levels_from_csv(path: str) -> List[float]:
     try:
@@ -177,7 +134,6 @@ def match_grid_row(grid_df: pd.DataFrame, level: float, tol: float = 0.003) -> p
     return row
 
 def init_csv_logger(path: str):
-    """เตรียมไฟล์ CSV สำหรับบันทึกการตัดสินใจรายบาร์"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     new_file = (not os.path.exists(path)) or os.path.getsize(path) == 0
     fh = open(path, "a", newline="")
@@ -194,7 +150,6 @@ def init_csv_logger(path: str):
     return fh, wr
 
 # ===================== DATA FETCHER =====================
-
 class DataFetcher:
     def __init__(self, symbol: str, exchange_id: str = "binance", with_auth: bool = False):
         self.symbol = symbol
@@ -205,7 +160,6 @@ class DataFetcher:
         self.exchange = getattr(ccxt, exchange_id)(kwargs)
         self.exchange.load_markets()
         self._imbalance_ema: Optional[float] = None
-        # ป้องกันดีดู้พ: ใช้ ts + id
         self._last_trade_ts: Optional[int] = None
         self._last_trade_id: Optional[str] = None
         self._last_trades_fetch_ms: int = 0
@@ -218,14 +172,11 @@ class DataFetcher:
             asks = ob.get("asks", []) or []
             if not bids or not asks:
                 return {"ok": False, "error": "empty_book"}
-
             best_bid = float(bids[0][0]); best_ask = float(asks[0][0])
             mid = (best_bid + best_ask) / 2.0
 
-            # ใช้เฉพาะ top-5 depth
             depth_bid_5 = float(np.sum([lvl[1] for lvl in bids[:5]]))
             depth_ask_5 = float(np.sum([lvl[1] for lvl in asks[:5]]))
-            # ใช้ total volume ที่ดึงมา (20 เลเวลก็พอประมาณ)
             total_bid_vol = float(np.sum([lvl[1] for lvl in bids]))
             total_ask_vol = float(np.sum([lvl[1] for lvl in asks]))
 
@@ -246,27 +197,22 @@ class DataFetcher:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     def fetch_recent_trades(self, limit: int = 100) -> Dict:
-        # throttle
         nowms = now_ms()
         if nowms - self._last_trades_fetch_ms < TRADES_POLL_MS:
             return {"ok": True, "trades": [], "error": None}
         self._last_trades_fetch_ms = nowms
-
         try:
             trades = self.exchange.fetch_trades(self.symbol, limit=limit)
             out = []
             for t in trades:
                 tid = str(t.get("id", ""))
                 ts_i = int(t.get("timestamp") or now_ms())
-                # กรองด้วย ts ก่อน ถ้าเท่ากันค่อยเทียบ id
                 if self._last_trade_ts is not None:
-                    if ts_i < self._last_trade_ts:
-                        continue
+                    if ts_i < self._last_trade_ts: continue
                     if ts_i == self._last_trade_ts and self._last_trade_id and tid <= self._last_trade_id:
                         continue
                 out.append({
-                    "id": tid,
-                    "ts": ts_i,
+                    "id": tid, "ts": ts_i,
                     "price": float(t["price"]), "amount": float(t["amount"]),
                     "cost": float(t["price"]) * float(t["amount"]),
                     "side": t.get("side"), "taker": t.get("takerOrMaker"),
@@ -274,13 +220,11 @@ class DataFetcher:
             if out:
                 self._last_trade_ts = out[-1]["ts"]
                 self._last_trade_id = out[-1]["id"]
-
             return {"ok": True, "trades": out, "error": None}
         except Exception as e:
             return {"ok": False, "trades": [], "error": f"{type(e).__name__}: {e}"}
 
 # ===================== AGGREGATOR 5s =====================
-
 class Aggregator5s:
     def __init__(self, bar_ms: int = 5000):
         self.bar_ms: int = bar_ms
@@ -292,8 +236,7 @@ class Aggregator5s:
         return ts_ms - (ts_ms % self.bar_ms)
 
     def add_orderbook_snapshot(self, snap: Dict) -> None:
-        if not snap.get("ok"):
-            return
+        if not snap.get("ok"): return
         ts = int(snap["ts"])
         ws = self._window_start(ts)
         if self.cur_window is None:
@@ -301,28 +244,24 @@ class Aggregator5s:
         self.ob_snaps.append(snap)
 
     def add_trades(self, payload: Dict) -> None:
-        if not payload.get("ok"):
-            return
+        if not payload.get("ok"): return
         self.trades_buf.extend(payload["trades"])
 
     def roll_bar(self, now_ms_: int) -> Optional[Dict]:
         if self.cur_window is None:
-            self.cur_window = self._window_start(now_ms_)
-            return None
-        if now_ms_ < self.cur_window + self.bar_ms:
-            return None
+            self.cur_window = self._window_start(now_ms_); return None
+        if now_ms_ < self.cur_window + self.bar_ms: return None
 
         ob = pd.DataFrame(self.ob_snaps) if self.ob_snaps else pd.DataFrame()
-
         def mean_or_none(col: str) -> Optional[float]:
             return float(ob[col].mean()) if (not ob.empty and col in ob) else None
 
-        mid = mean_or_none("mid_price")
-        tb  = mean_or_none("total_bid_volume")
-        ta  = mean_or_none("total_ask_volume")
-        db5 = mean_or_none("depth_bid_5")
-        da5 = mean_or_none("depth_ask_5")
-        imb = mean_or_none("order_imbalance")
+        mid  = mean_or_none("mid_price")
+        tb   = mean_or_none("total_bid_volume")
+        ta   = mean_or_none("total_ask_volume")
+        db5  = mean_or_none("depth_bid_5")
+        da5  = mean_or_none("depth_ask_5")
+        imb  = mean_or_none("order_imbalance")
 
         tdf = pd.DataFrame(self.trades_buf) if self.trades_buf else pd.DataFrame()
         if not tdf.empty:
@@ -348,13 +287,11 @@ class Aggregator5s:
             "trade_size_buy_5s": trade_size_buy, "data_quality": data_quality,
         }
 
-        self.ob_snaps.clear()
-        self.trades_buf.clear()
+        self.ob_snaps.clear(); self.trades_buf.clear()
         self.cur_window += self.bar_ms
         return bar
 
 # ===================== SIGNAL ENGINE =====================
-
 class SignalEngine:
     def __init__(self, grid_levels: List[float], grid_tol: float = GRID_TOL,
                  confirm_needed: int = CONFIRM_BARS, cooldown_ms: int = COOLDOWN_MS,
@@ -378,36 +315,27 @@ class SignalEngine:
 
     @staticmethod
     def mad_z(x: List[float], x_now: float) -> float:
-        if len(x) < 1:
-            return np.nan
+        if len(x) < 1: return np.nan
         arr = np.asarray(x, dtype=float)
         med = np.median(arr)
         mad = np.median(np.abs(arr - med))
         return 0.6745 * (x_now - med) / max(mad, 1e-9)
 
     def _is_locked(self, lv: float) -> bool:
-        if lv in self.active_levels:
-            return True
+        if lv in self.active_levels: return True
         for a in self.active_levels:
             if abs(lv - a) / max(lv, 1e-9) <= LOCK_TOL:
                 return True
         return False
 
     def _pick_grid_candidate(self, mid: Optional[float]) -> Optional[float]:
-        """
-        FIX: คืนเฉพาะเลเวลที่อยู่ในระยะ GRID_TOL และยังไม่ถูกล็อก
-        """
-        if mid is None or not self.grid_levels_open:
-            return None
-        near = [lv for lv in self.grid_levels_open
-                if abs(lv - mid) / max(lv, 1e-12) <= self.grid_tol]
-        for lv in sorted(near, key=lambda x: abs(x - mid)):
-            if not self._is_locked(lv):
-                return lv
+        if mid is None or not self.grid_levels_open: return None
+        near = [lv for lv in self.grid_levels_open if abs(lv - mid)/max(lv,1e-12) <= self.grid_tol]
+        for lv in sorted(near, key=lambda x: abs(x-mid)):
+            if not self._is_locked(lv): return lv
         if ALLOW_FALLBACK_EXEC:
             lowers = [lv for lv in self.grid_levels_open if lv < mid and not self._is_locked(lv)]
-            if lowers:
-                return max(lowers)
+            if lowers: return max(lowers)
         return None
 
     def update(self, bar: Dict, now_ms_: int, max_open_orders: int) -> Dict:
@@ -476,7 +404,6 @@ class SignalEngine:
         self.active_levels.discard(level)
 
 # ===================== EXECUTION LAYER =====================
-
 class ExecutionLayer:
     def __init__(self, fetcher: DataFetcher, symbol: str, dry_run: bool = True):
         self.ex = fetcher.exchange
@@ -490,6 +417,7 @@ class ExecutionLayer:
         self.tp_ids: Dict[float, str] = {}
         self._last_poll_ts: float = 0.0
 
+    # ---------- filters ----------
     def _extract_filters(self, market: Dict) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         tick = step = min_qty = min_notional = None
         for f in market.get("info", {}).get("filters", []):
@@ -510,18 +438,21 @@ class ExecutionLayer:
         return tick, step, min_qty, (min_notional or 0.0)
 
     def _price_tol(self, ref_px: float) -> float:
-        """
-        เกณฑ์ทนทาน: มากสุดระหว่าง LOCK_TOL แบบ % และ 5 ticks
-        ทำให้ TP ที่ปัดราคาขึ้นคนละทศนิยม/ไฟล์กริดคนละเวอร์ชัน ยังจับคู่ได้
-        """
         tick = self.tick_size or 0.0
         return max(LOCK_TOL * max(ref_px, 1e-9), 5.0 * tick)
 
+    # ---------- assets & balances ----------
     def _quote_asset(self) -> str:
         try:
             return self.market.get("quote") or self.symbol.split("/")[1]
         except Exception:
             return self.symbol.split("/")[1]
+
+    def _base_asset(self) -> str:
+        try:
+            return self.market.get("base") or self.symbol.split("/")[0]
+        except Exception:
+            return self.symbol.split("/")[0]
 
     def _get_free_quote(self) -> float:
         try:
@@ -535,80 +466,52 @@ class ExecutionLayer:
             pass
         return 0.0
 
-    def poll(self, engine: "SignalEngine", grid_rows: pd.DataFrame) -> None:
-        if self.dry or not self.tp_ids:
-            return
-        now = time.time()
-        if now - self._last_poll_ts < POLL_OPEN_ORDERS_SEC:
-            return
-        self._last_poll_ts = now
-
-        for level, oid in list(self.tp_ids.items()):
-            try:
-                o = self.ex.fetch_order(oid, self.symbol)
-                status = (o.get("status") or "").lower()
-                if status == "closed":
-                    engine.on_tp_filled(now_ms(), level)
-                    self.tp_ids.pop(level, None); self.buy_ids.pop(level, None)
-                elif status == "canceled":
-                    engine.active_levels.discard(level)
-                    self.tp_ids.pop(level, None); self.buy_ids.pop(level, None)
-            except Exception:
-                pass
-
-    def resync_open_orders(self, engine: "SignalEngine", grid_df: pd.DataFrame) -> None:
+    def _get_free_base(self) -> float:
         try:
-            oo = self.ex.fetch_open_orders(self.symbol)
+            bal = self.ex.fetch_balance()
+            base = self._base_asset()
+            if "free" in bal and base in bal["free"]:
+                return float(bal["free"][base])
+            if base in bal and isinstance(bal[base], dict):
+                return float(bal[base].get("free", 0.0))
         except Exception:
+            pass
+        return 0.0
+
+    # ---------- dust ledger ----------
+    def _append_dust_ledger(self,
+                            remainder_qty: float,
+                            unit_cost_usdt: float,
+                            reason: str,
+                            ctx: Optional[dict] = None) -> None:
+        """บันทึกเศษลง CSV: ts,symbol,remainder_qty,unit_cost_usdt,est_cost_total_usdt,reason,order_id,planned_tp,stepSize,minQty,minNotional"""
+        if remainder_qty is None or remainder_qty <= 0:
             return
+        row = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": getattr(self, "symbol", ""),
+            "remainder_qty": f"{float(remainder_qty):.10f}",
+            "unit_cost_usdt": f"{float(unit_cost_usdt):.8f}",
+            "est_cost_total_usdt": f"{float(remainder_qty) * float(unit_cost_usdt):.8f}",
+            "reason": reason,
+            "order_id": (ctx or {}).get("order_id", ""),
+            "planned_tp": (ctx or {}).get("planned_tp", ""),
+            "stepSize": (ctx or {}).get("step", self.step_size),
+            "minQty": (ctx or {}).get("min_qty", self.min_qty),
+            "minNotional": (ctx or {}).get("min_notional", self.min_notional),
+        }
+        need_header = not os.path.exists(DUST_LEDGER_FILE)
+        try:
+            with open(DUST_LEDGER_FILE, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if need_header:
+                    w.writeheader()
+                w.writerow(row)
+        except Exception as e:
+            print(f"[WARN] cannot write {DUST_LEDGER_FILE}: {e}")
 
-        # rebuild maps from scratch
-        new_active = set()
-        new_tp_ids, new_buy_ids = {}, {}
-
-        for o in oo:
-            px = float(o.get("price") or 0.0)
-            side = (o.get("side") or "").lower()
-            lv = self.level_key_from_order(grid_df, px, side)
-            if lv is None:
-                continue
-            new_active.add(lv)
-            if side == "sell": new_tp_ids[lv] = o.get("id")
-            elif side == "buy": new_buy_ids[lv] = o.get("id")
-
-        self.tp_ids = new_tp_ids
-        self.buy_ids = new_buy_ids
-        engine.active_levels = new_active
-        engine.open_orders_count = sum(1 for o in oo if (o.get("side") or "").lower() == "sell")
-
-    def level_key_from_order(self, grid_df: pd.DataFrame, px: float, side: str) -> Optional[float]:
-        """
-        ฝั่ง BUY: แม็พกับ buy_price
-        ฝั่ง SELL: แม็พกับ tp_price แล้วคืน key เป็น buy_price
-        ใช้ tolerance แบบ max(% , ticks)
-        """
-        side = (side or "").lower()
-        if px <= 0:
-            return None
-
-        if side == "sell" and "tp_price" in grid_df.columns:
-            diffs = (grid_df["tp_price"] - px).abs()
-            i = int(diffs.idxmin())
-            ref = float(grid_df.loc[i, "tp_price"])
-            tol = self._price_tol(ref)
-            if abs(ref - px) <= tol:
-                return float(grid_df.loc[i, "buy_price"])
-            return None
-        else:
-            diffs = (grid_df["buy_price"] - px).abs()
-            i = int(diffs.idxmin())
-            ref = float(grid_df.loc[i, "buy_price"])
-            tol = self._price_tol(ref)
-            return float(ref) if abs(ref - px) <= tol else None
-
-    # ---- rounding helpers (Decimal) ----
+    # ---------- helpers ----------
     def round_price(self, p: float, side: Optional[str] = None) -> float:
-        """BUY → floor, SELL → ceil"""
         if (self.tick_size or 0) <= 0:
             return p
         q = _q(p) / _q(self.tick_size)
@@ -635,7 +538,6 @@ class ExecutionLayer:
             need = max(need, self.min_qty)
         return self.round_amount_up(need)
 
-    # ---------- best prices ----------
     def _best_prices(self) -> tuple:
         try:
             ob = self.ex.fetch_order_book(self.symbol, limit=5)
@@ -644,51 +546,69 @@ class ExecutionLayer:
         except Exception:
             return (0.0, 0.0)
 
-    # ---------- สร้าง clientOrderId ที่ถูกกติกา ----------
+    def _avg_fill_price_from_order(self, order: dict, fallback_price: float) -> float:
+        try:
+            filled = float(order.get("filled", 0.0) or 0.0)
+            cost   = float(order.get("cost",   0.0) or 0.0)
+            if filled > 0 and cost > 0:
+                return cost / filled
+        except Exception:
+            pass
+        return float(fallback_price or 0.0)
+
     def _cid(self, prefix: str, price: float) -> str:
         sym = self.symbol.replace("/", "")
         tick = self.tick_size or 1e-8
         p_ticks = int(round(price / tick))
         t = int(time.time())
-        cid = f"{prefix}-{sym}-{p_ticks}-{t}"
-        return cid[:36]
+        return f"{prefix}-{sym}-{p_ticks}-{t}"[:36]
 
-    # ---------- MARKET BUY (taker 100%) ----------
-    def place_market_buy(self, level: float, desired_amount: float) -> Dict:
+    # ---------- MARKET BUY via quoteOrderQty ----------
+    def place_market_buy(self, level: float, desired_amount: float) -> dict:
         _bid, ask = self._best_prices()
         px_ref = ask * (1.0 + max(0.0, SLIP_PCT)) if ask > 0 else level
 
-        need_amt = self.ensure_min_notional(px_ref, desired_amount)
-        quote_free = self._get_free_quote()
-        affordable_amt = self.round_amount_down(max(0.0, quote_free / max(px_ref, 1e-12)))
-        amt = min(need_amt, affordable_amt)
+        # เงินว่าง USDT
+        quote_free = float(self._get_free_quote() or 0.0)
 
-        if (amt <= 0) or (self.min_qty and amt < self.min_qty) or \
-           (self.min_notional and amt * px_ref < self.min_notional):
-            print(f"[skip] insufficient quote balance for level {level} "
-                  f"(need≈{need_amt}, affordable≈{affordable_amt}, quote_free≈{quote_free})")
+        # งบขั้นต่ำ = max(coin_size*px_ref, minNotional) + safety
+        base_cost = max(desired_amount * px_ref, float(self.min_notional or 5.0))
+        pad_abs = 0.05
+        pad_pct = 0.002
+        safety = max(pad_abs, base_cost * pad_pct)
+        quote_need = base_cost + safety
+
+        # อย่าเกินเงินว่าง และปัดลงเป็นหน่วยเซ็นต์
+        q_send = min(quote_need, quote_free)
+        q_send = math.floor(max(0.0, q_send) * 100.0) / 100.0
+
+        if q_send < (self.min_notional or 5.0):
+            print(f"[skip] quoteOrderQty<{self.min_notional} USDT (want≈{quote_need:.2f}, free≈{quote_free:.2f}, send={q_send:.2f})")
             return {"id": None, "filled": 0.0, "avg": None, "amt_sent": 0.0, "px_ref": px_ref}
 
         if self.dry:
-            print(f"[DRY] MARKET BUY {self.symbol} amt≈{amt} (px_ref≈{px_ref:.8f})")
-            return {"id": f"dry-mkt-{level}", "filled": amt, "avg": px_ref, "amt_sent": amt, "px_ref": px_ref}
+            print(f"[DRY] MARKET BUY by quoteOrderQty={q_send:.2f} {self.symbol} (px_ref≈{px_ref:.8f})")
+            return {"id": f"dry-mkt-quote-{level}", "filled": q_send/px_ref, "avg": px_ref, "amt_sent": q_send/px_ref, "px_ref": px_ref}
 
         try:
             o = self.ex.create_order(
-                self.symbol, "market", "buy", amt, None,
-                {"newClientOrderId": self._cid("gbM", px_ref), "newOrderRespType": "FULL"}
+                self.symbol, "market", "buy", None, None,
+                {"quoteOrderQty": q_send, "newClientOrderId": self._cid("gbQ", px_ref), "newOrderRespType": "FULL"}
             )
             filled = float(o.get("filled") or 0.0)
-            avg    = float(o.get("average") or px_ref) if filled > 0 else None
-            return {"id": o.get("id"), "filled": filled, "avg": avg, "px_ref": px_ref, "amt_sent": amt}
+            avg = self._avg_fill_price_from_order(o, px_ref)
+            print(f"[buy-debug] level={level:.2f} px_ref={px_ref:.8f} coin_size_req={desired_amount} "
+                  f"quote_need≈{quote_need:.2f} quote_sent={q_send:.2f} filled={filled:.8f} avg={avg:.8f} "
+                  f"filters(minNotional={self.min_notional}, minQty={self.min_qty}, step={self.step_size})")
+            return {"id": o.get("id"), "filled": filled, "avg": avg, "amt_sent": filled, "px_ref": px_ref}
         except Exception as e:
-            print(f"[ERR] market buy failed: {e}")
+            print(f"[ERR] market buy (quoteOrderQty) failed: {e}")
             return {"id": None, "filled": 0.0, "avg": None, "amt_sent": 0.0, "px_ref": px_ref}
 
-    # ---------- LIMIT SELL TP (Decimal: ราคา ceil, จำนวน floor) ----------
+    # ---------- LIMIT SELL TP ----------
     def place_limit_sell_tp(self, level: float, amount: float, tp_price: float) -> Optional[str]:
-        px = self.round_price(tp_price, side="sell")          # ปัดขึ้น
-        amt = self.round_amount_down(amount)                  # ปัดลง
+        px = self.round_price(tp_price, side="sell")
+        amt = self.round_amount_down(amount)
         if amt <= 0:
             return None
         if self.dry:
@@ -701,25 +621,6 @@ class ExecutionLayer:
         except Exception as e:
             print(f"[ERR] place TP failed @ {px}: {e}")
             return None
-
-    # ---------- helper: base asset / balance ----------
-    def _base_asset(self) -> str:
-        try:
-            return self.market.get("base") or self.symbol.split("/")[0]
-        except Exception:
-            return self.symbol.split("/")[0]
-
-    def _get_free_base(self) -> float:
-        try:
-            bal = self.ex.fetch_balance()
-            base = self._base_asset()
-            if "free" in bal and base in bal["free"]:
-                return float(bal["free"][base])
-            if base in bal and isinstance(bal[base], dict):
-                return float(bal[base].get("free", 0.0))
-        except Exception:
-            pass
-        return 0.0
 
     def _wait_filled(self, order_id: str, timeout: float = 2.0) -> float:
         if not order_id:
@@ -739,7 +640,6 @@ class ExecutionLayer:
         return last_filled
 
     def _safe_tp_amount(self, desired_amt: float, tp_price: float) -> float:
-        """floor ตาม LOT_SIZE และบังคับผ่าน minQty/minNotional"""
         amt = max(0.0, float(desired_amt))
         if amt <= 0:
             return 0.0
@@ -752,27 +652,47 @@ class ExecutionLayer:
 
     def place_tp_after_market(self, level: float, market_order_id: Optional[str],
                               desired_amt: float, tp_price: float) -> Optional[str]:
-        """
-        รอฟิลล์/เช็ค balance แล้ววาง TP ด้วยจำนวนที่ปลอดภัย:
-        - ปัดจำนวนลงตาม LOT_SIZE
-        - ถ้า amt_floor*tp ยัง < minNotional → ยก tp ให้พ้น notional
-        - บังคับ TP ≥ best_bid*(1+TP_BID_SAFETY_PCT)
-        """
+        """ตั้ง TP แบบปลอดภัย + จัดการบันทึก dust"""
         if self.dry:
             print(f"[DRY] place TP after market: tp_price={tp_price}")
             return f"dry-tp-{level}"
 
-        filled_from_order = self._wait_filled(market_order_id, 2.0) if market_order_id else 0.0
+        # ดึงคำสั่งซื้อเพื่ออ่าน filled/cost (สำหรับ avg)
+        order_obj = None
+        filled_from_order = 0.0
+        try:
+            if market_order_id:
+                order_obj = self.ex.fetch_order(market_order_id, self.symbol)
+                filled_from_order = float(order_obj.get("filled") or 0.0)
+        except Exception:
+            filled_from_order = self._wait_filled(market_order_id, 2.0) if market_order_id else 0.0
+
+        _best_bid, best_ask = self._best_prices()
+        avg_cost = self._avg_fill_price_from_order(order_obj or {}, fallback_price=best_ask or tp_price)
+
         time.sleep(0.25)  # ให้ balance sync
         free_base = self._get_free_base()
 
         cap = min(max(desired_amt, 0.0),
                   filled_from_order if filled_from_order > 0 else free_base,
                   free_base)
-
         amt_floor = self.round_amount_down(cap)
 
+        # log เศษจาก LOT_SIZE
+        remainder = max(0.0, cap - amt_floor)
+        if remainder > 0:
+            self._append_dust_ledger(
+                remainder_qty=remainder, unit_cost_usdt=avg_cost, reason="lot_rounding",
+                ctx={"order_id": market_order_id, "planned_tp": tp_price,
+                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
+            )
+
         if self.min_qty and amt_floor < self.min_qty:
+            self._append_dust_ledger(
+                remainder_qty=amt_floor, unit_cost_usdt=avg_cost, reason="minQty_gate",
+                ctx={"order_id": market_order_id, "planned_tp": tp_price,
+                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
+            )
             print(f"[skip] TP not placed (amt<{self.min_qty} minQty | free={free_base} | filled={filled_from_order})")
             return None
 
@@ -786,14 +706,89 @@ class ExecutionLayer:
 
         sell_amt = self._safe_tp_amount(amt_floor, tp_price)
         if sell_amt <= 0:
+            self._append_dust_ledger(
+                remainder_qty=amt_floor, unit_cost_usdt=avg_cost,
+                reason="minNotional_gate" if (self.min_notional and amt_floor * tp_price < self.min_notional) else "tp_not_placed",
+                ctx={"order_id": market_order_id, "planned_tp": tp_price,
+                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
+            )
             print(f"[skip] TP not placed (sell_amt={sell_amt} | free={free_base} | filled={filled_from_order} "
                   f"| minQty={self.min_qty} | minNotional={self.min_notional} | step={self.step_size})")
             return None
 
-        return self.place_limit_sell_tp(level, sell_amt, tp_price)
+        try:
+            print(f"[tp-debug] avg_cost={avg_cost:.6f} tp_px_in={tp_price:.6f} sell_amt≈{sell_amt}")
+        except Exception:
+            pass
+
+        oid = self.place_limit_sell_tp(level, sell_amt, tp_price)
+        if not oid:
+            self._append_dust_ledger(
+                remainder_qty=sell_amt, unit_cost_usdt=avg_cost, reason="tp_place_failed",
+                ctx={"order_id": market_order_id, "planned_tp": tp_price,
+                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
+            )
+        return oid
+
+    # ---------- open orders sync ----------
+    def poll(self, engine: "SignalEngine", grid_rows: pd.DataFrame) -> None:
+        if self.dry or not self.tp_ids:
+            return
+        now = time.time()
+        if now - self._last_poll_ts < POLL_OPEN_ORDERS_SEC:
+            return
+        self._last_poll_ts = now
+        for level, oid in list(self.tp_ids.items()):
+            try:
+                o = self.ex.fetch_order(oid, self.symbol)
+                status = (o.get("status") or "").lower()
+                if status == "closed":
+                    engine.on_tp_filled(now_ms(), level)
+                    self.tp_ids.pop(level, None); self.buy_ids.pop(level, None)
+                elif status == "canceled":
+                    engine.active_levels.discard(level)
+                    self.tp_ids.pop(level, None); self.buy_ids.pop(level, None)
+            except Exception:
+                pass
+
+    def resync_open_orders(self, engine: "SignalEngine", grid_df: pd.DataFrame) -> None:
+        try:
+            oo = self.ex.fetch_open_orders(self.symbol)
+        except Exception:
+            return
+        new_active = set(); new_tp_ids, new_buy_ids = {}, {}
+        for o in oo:
+            px = float(o.get("price") or 0.0)
+            side = (o.get("side") or "").lower()
+            lv = self.level_key_from_order(grid_df, px, side)
+            if lv is None: continue
+            new_active.add(lv)
+            if side == "sell": new_tp_ids[lv] = o.get("id")
+            elif side == "buy": new_buy_ids[lv] = o.get("id")
+        self.tp_ids = new_tp_ids; self.buy_ids = new_buy_ids
+        engine.active_levels = new_active
+        engine.open_orders_count = sum(1 for o in oo if (o.get("side") or "").lower() == "sell")
+
+    def level_key_from_order(self, grid_df: pd.DataFrame, px: float, side: str) -> Optional[float]:
+        side = (side or "").lower()
+        if px <= 0: return None
+        if side == "sell" and "tp_price" in grid_df.columns:
+            diffs = (grid_df["tp_price"] - px).abs(); i = int(diffs.idxmin())
+            ref = float(grid_df.loc[i, "tp_price"]); tol = self._price_tol(ref)
+            return float(grid_df.loc[i, "buy_price"]) if abs(ref - px) <= tol else None
+        else:
+            diffs = (grid_df["buy_price"] - px).abs(); i = int(diffs.idxmin())
+            ref = float(grid_df.loc[i, "buy_price"]); tol = self._price_tol(ref)
+            return float(ref) if abs(ref - px) <= tol else None
 
     # ---------- pre-lock existing open orders ----------
     def prelock_existing(self, engine: "SignalEngine", grid_df: pd.DataFrame) -> None:
+        """
+        อ่าน open orders จากเอ็กซ์เชนจ์ แล้ว map → level เพื่อ:
+          - set engine.open_orders_count = จำนวน SELL (TP) ที่ค้างจริง
+          - เติม self.buy_ids / self.tp_ids
+          - ใส่ engine.active_levels ให้ตรงกับของจริง
+        """
         try:
             oo = self.ex.fetch_open_orders(self.symbol)
         except Exception:
@@ -801,17 +796,17 @@ class ExecutionLayer:
 
         buys = sells = locked = 0
 
-        # นับจำนวน SELL จริงในพอร์ต (ใช้เป็น open deals แบบ ground truth)
+        # จำนวนดีลเปิดจริง = นับ SELL ที่ค้าง (TP)
         exchange_sells = sum(1 for o in oo if (o.get("side") or "").lower() == "sell")
-        engine.open_orders_count = exchange_sells  # ให้ตัวเลข 'open=' เท่าความจริงทันทีตั้งแต่เริ่ม
+        engine.open_orders_count = exchange_sells
 
-        # loop แม็พ order -> level
         for o in oo:
             px = float(o.get("price") or 0.0)
             side = (o.get("side") or "").lower()
 
             lv = self.level_key_from_order(grid_df, px, side)
 
+            # debug: SELL ที่หา level ไม่เจอ
             if lv is None:
                 if side == "sell" and SHOW_UNMAPPED_SELL_DEBUG:
                     try:
@@ -839,12 +834,11 @@ class ExecutionLayer:
                 f"open_deals={engine.open_orders_count}"
             )
 
-# ===================== MAIN =====================
 
+# ===================== MAIN =====================
 def main() -> None:
     print("[i] เริ่มดึงข้อมูลสดจาก Binance …")
 
-    # โหลดกริด (สำหรับสัญญาณ/การแมตช์ระดับ)
     grid_levels = load_grid_levels_from_csv(GRID_CSV)
     if not grid_levels:
         print(f"[!] ไม่พบไฟล์กริด {GRID_CSV} หรืออ่านไม่ได้ — จะทำงานเฉพาะสัญญาณ (ไม่เช็คใกล้กริด)")
@@ -853,14 +847,11 @@ def main() -> None:
     except Exception:
         grid_df = pd.DataFrame(columns=["buy_price","coin_size","tp_price"])
 
-
-    # <<< สำคัญ: อ่านสัญลักษณ์จาก macro_montecarlo.csv >>>
     symbol = detect_symbol_from_macro("macro_montecarlo.csv")
     symbol_safe = symbol.replace("/", "").lower()
     log_csv_path = os.path.join("logs", f"{symbol_safe}_5s_decisions.csv")
     print(f"[i] Trading symbol = {symbol} (from macro_montecarlo.csv)")
 
-    # Engine / Fetcher / Executor
     engine = SignalEngine(
         grid_levels=grid_levels,
         confirm_needed=CONFIRM_BARS,
@@ -871,14 +862,10 @@ def main() -> None:
     )
     fetcher = DataFetcher(symbol, EXCHANGE_ID, with_auth=(not DRY_RUN))
     execu = ExecutionLayer(fetcher, symbol, dry_run=DRY_RUN)
-
     aggr = Aggregator5s(BAR_MS)
 
-    
-    # CSV logger (ตาม symbol)
     csv_fh, csv_wr = init_csv_logger(log_csv_path)
 
-    # pre-lock จาก open orders
     execu.prelock_existing(engine, grid_df)
 
     last_grid_reload = time.time()
@@ -988,7 +975,7 @@ def main() -> None:
                     engine.active_levels.discard(level)
                     continue
 
-                # ยิง MARKET BUY
+                # ยิง MARKET BUY (quoteOrderQty ภายในฟังก์ชัน)
                 res = execu.place_market_buy(level, coin_size)
                 market_id = res.get("id")
                 filled_amt = res["filled"] if res["filled"] > 0 else coin_size
@@ -1009,7 +996,7 @@ def main() -> None:
                     except Exception:
                         pass
 
-                    # วาง TP แบบปลอดภัย (รอฟิลล์ + เช็ค balance + notional)
+                    # วาง TP แบบปลอดภัย (รอฟิลล์ + เช็ค balance + notional + dust tracker ในตัว)
                     tp_id = execu.place_tp_after_market(level, market_id, filled_amt, tp_px)
                     if tp_id:
                         execu.tp_ids[level] = tp_id
@@ -1031,5 +1018,12 @@ def main() -> None:
         except Exception:
             pass
 
+# --- entrypoint ---
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"[FATAL] {type(e).__name__}: {e}")
+        traceback.print_exc()
+
