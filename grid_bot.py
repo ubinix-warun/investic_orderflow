@@ -5,52 +5,36 @@
 Live 5s bars + Signal + Grid Execution (Spot Binance, ccxt)
 - สัญญาณ: MAD-zscore (window=50), ยืนยัน 1 แท่ง
 - ซื้อเฉพาะเมื่อใกล้กริด ≤ GRID_TOL
-- กันเปิดซ้ำระดับ: pre-lock จาก open orders, ตรวจซ้ำก่อนยิง, map order → level
+- กันเปิดซ้ำระดับ: pre-lock จาก open orders, ตรวจซ้ำก่อนยิง, map order→level
 - BUY = MARKET 100% แล้ววาง TP เป็น LIMIT SELL ทันที
 
-แพตช์/อัปเดตล่าสุด
-  [High-priced buy rule]
-    - ถ้า best_ask ≥ HIGH_PRICE_THRESHOLD (ดีฟอลต์ 1000 USDT) → MARKET BUY ด้วย quoteOrderQty
-      โดยคำนวณ q = coin_size * px_ref * QUOTE_SAFETY (ดีฟอลต์ 0.999) เพื่อเลี่ยง insufficient funds
-    - ใช้ newOrderRespType='FULL' และคำนวณ avg price จาก cost/filled (ถ้ามี)
-
-  [Dust ledger (บันทึกเศษไว้ขายมือ)]
-    - ไม่จัดการเศษอัตโนมัติ แต่ “บันทึก” เศษและต้นทุนลงไฟล์ DUST_LEDGER_FILE (dust_ledger.csv)
-    - กรณีที่บันทึก: 
-        • lot_rounding (ปัด LOT_SIZE แล้วเหลือเศษ) 
-        • minQty_gate / minNotional_gate (ตั้งขายไม่ได้เพราะต่ำกว่าเกณฑ์ตลาด) 
-        • tp_place_failed (ส่ง TP แล้วถูกปฏิเสธ)
-    - คอลัมน์ไฟล์: ts, symbol, remainder_qty, unit_cost_usdt, est_cost_total_usdt, 
-      reason, order_id, planned_tp, stepSize, minQty, minNotional
-
+แพตช์/ฮาร์เดน:
   [API load]
     - ลด BOOK_LIMIT เหลือ 20 (พอสำหรับ top-of-book/depth 5)
-    - fetch_recent_trades ทุก ~1.2s (Throttle)
-    - poll open orders แบบเว้นช่วง + ตรวจสถานะรายออเดอร์ (closed/canceled)
+    - ลดความถี่ fetch_recent_trades เป็นทุก ~1.2s
+    - poll open orders แบบเว้นช่วง และตรวจสถานะรายออเดอร์ (closed/canceled)
 
   [ความถูกต้อง]
-    - กันเทรดซ้ำด้วย timestamp+id (ไม่เทียบ id เป็นสตริงล้วน)
-    - MARKET BUY ส่ง newOrderRespType='FULL'; average ใช้ cost/filled เป็นหลัก
-    - ปัดราคา/จำนวนด้วย Decimal: ราคา BUY→floor, SELL→ceil; จำนวนขายปัดลงตาม LOT_SIZE
+    - ดักดีดู้พเทรดด้วย timestamp+id (ไม่เทียบ id เป็นสตริงล้วน)
+    - newOrderRespType='FULL' เพื่อได้ average/fills จาก MARKET BUY
+    - rounding ด้วย Decimal (ceil/floor ตาม tick & lot) กัน float เพี้ยน
 
   [กติกา exchange]
-    - min_notional = max(ค่าจากตลาด, MIN_NOTIONAL_OVERRIDE)
-    - TP ขั้นต่ำ = max(row_tp, fill_avg*(1+2*EXEC_FEE_RATE+TP_EXTRA_MARGIN), tp_need_from_minNotional)
+    - min_notional ใช้ max(ค่าจากตลาด, MIN_NOTIONAL_OVERRIDE) (ไม่ลดต่ำกว่าค่าจริง)
+    - TP ขั้นต่ำ = max(row_tp, fill_avg*(1+2*fee+extra), tp_need_from_minNotional)
     - ราคา TP ฝั่งขายปัดขึ้นตาม tick, จำนวนขายปัดลงตาม LOT_SIZE
-    - กัน TP ต่ำเกิน bid ด้วย best_bid * (1 + TP_BID_SAFETY_PCT)
+    - กัน TP ต่ำเกิน bid ด้วย best_bid* (1+TP_BID_SAFETY_PCT)
 
   [UX/เสถียรภาพ]
-    - pre-lock เฉพาะกรณีราคาเปิดใกล้ buy_price จริง
-    - รอ balance sync สั้น ๆ ก่อนตั้ง TP
-    - ปิดไฟล์ CSV อย่างปลอดภัยเมื่อ Ctrl-C (try/finally)
+    - pre-lock เฉพาะกรณีราคาเปิดใกล้ buy_price จริง (ไม่ปัด floor เป็นคีย์อื่น)
+    - try/finally ปิด CSV เมื่อ Ctrl-C
 
   [FIX บั๊กสำคัญ]
-    - _pick_grid_candidate(): คืนเฉพาะเลเวลที่ “ใกล้กริดจริง” เท่านั้น (ตัด fallback)
-    - update(): within_tol = |mid − level| / level ≤ GRID_TOL
-    - ก่อนยิงคำสั่ง เช็คแถวใน CSV + ความใกล้กริดอีกครั้ง ไม่ผ่าน → skip และปลดล็อก
-    - prelock_existing(): แม็พ SELL (TP) ด้วย tp_price และตั้ง open_orders_count จากจำนวน SELL ที่ค้าง
+    - _pick_grid_candidate() คืนเฉพาะเลเวลที่ “ใกล้กริดจริง” เท่านั้น (ตัด fallback)
+    - update(): within_tol = ระยะห่างกับ mid ≤ GRID_TOL (ไม่ใช่แค่ candidate != None)
+    - ก่อนยิงคำสั่ง ตรวจ CSV row และความใกล้กริดอีกครั้ง ถ้าไม่ผ่าน → skip
+    - prelock_existing(): แม็พ SELL (TP) ด้วย tp_price แล้วตั้ง open_orders_count จาก TP ที่ค้าง
 """
-
 
 import csv
 import os
@@ -87,10 +71,10 @@ COOLDOWN_MS = 60_000        # คูลดาวน์หลัง BUY สำเ
 
 # z-score threshold
 WINDOW = 50                 # ขนาดหน้าต่างย้อนหลัง
-CVD_Z_TH = 1.5
+CVD_Z_TH = 2
 TS_Z_TH  = 1.5
 
-MAX_OPEN_ORDERS = 20        # จำกัดดีลเปิดพร้อมกันสูงสุด
+MAX_OPEN_ORDERS = 10        # จำกัดดีลเปิดพร้อมกันสูงสุด
 
 GRID_CSV = "grid_plan.csv"  # ไฟล์กริด (ต้องมี buy_price, coin_size, tp_price/tp_pct)
 GRID_RELOAD_SEC = 0         # รีโหลดกริดอัตโนมัติทุก N วินาที (0=ปิด)
@@ -106,7 +90,7 @@ TP_EXTRA_MARGIN = 0.0005    # กันเผื่อจากฟิลจร�
 TP_BID_SAFETY_PCT = 0.0001  # 0.01% กัน TP ต่ำกว่าบิดมากไปจนโดนรับทันที
 
 # Poll/Throttle
-TRADES_POLL_MS = 2000       # ดึง recent trades อย่างน้อยทุก 2s
+TRADES_POLL_MS = 1200       # ดึง recent trades อย่างน้อยทุก 1.2s
 POLL_OPEN_ORDERS_SEC = 3.0  # โพลล์สถานะ TP รายออเดอร์ทุก 3 วินาที
 
 # resync actual orders
@@ -115,12 +99,6 @@ RESYNC_OPEN_ORDERS_SEC = 60  # 0=ปิด
 # =============== LOGGING SWITCHES ===============
 SHOW_PRELOCK_SUMMARY = False      # ปิดสรุป pre-locked (บรรทัดยาวชวนงง)
 SHOW_UNMAPPED_SELL_DEBUG = False  # ปิด debug unmapped SELL ... Δ=... ticks
-
-
-# ==== Dust logging & high-price rule ====
-HIGH_PRICE_THRESHOLD = 1000.0     # ถ้าราคา >= ค่านี้ ใช้ market buy แบบ quoteOrderQty
-QUOTE_SAFETY         = 0.999      # กันงบเผื่อจิ๋ว ๆ เวลา quoteOrderQty
-DUST_LEDGER_FILE     = "dust_ledger.csv"  # ไฟล์บันทึกเศษเพื่อขาย manual
 
 
 # ===================== UTILS =====================
@@ -597,63 +575,6 @@ class ExecutionLayer:
             except Exception:
                 pass
 
-
-    def _append_dust_ledger(self,
-                            remainder_qty: float,
-                            unit_cost_usdt: float,
-                            reason: str,
-                            ctx: Optional[dict] = None) -> None:
-        """
-        บันทึกเศษที่ขายไม่ออกลงไฟล์ CSV:
-        - remainder_qty: ปริมาณ BASE (เช่น PAXG) ที่เหลือขายไม่ได้
-        - unit_cost_usdt: ต้นทุนต่อ 1 หน่วย (USDT per BASE), คิดจากคำสั่ง buy ล่าสุด
-        - reason: สาเหตุสั้น ๆ (e.g., 'lot_rounding', 'minNotional_gate', 'tp_place_failed')
-        - ctx: ข้อมูลประกอบ เช่น order_id, planned_tp, stepSize ฯลฯ
-        """
-        if remainder_qty is None or remainder_qty <= 0:
-            return
-        row = {
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": getattr(self, "symbol", ""),
-            "remainder_qty": f"{float(remainder_qty):.10f}",
-            "unit_cost_usdt": f"{float(unit_cost_usdt):.8f}",
-            "est_cost_total_usdt": f"{float(remainder_qty) * float(unit_cost_usdt):.8f}",
-            "reason": reason,
-            "order_id": (ctx or {}).get("order_id", ""),
-            "planned_tp": (ctx or {}).get("planned_tp", ""),
-            "stepSize": (ctx or {}).get("step", ""),
-            "minQty": (ctx or {}).get("min_qty", ""),
-            "minNotional": (ctx or {}).get("min_notional", ""),
-        }
-        header = list(row.keys())
-        need_header = not os.path.exists(DUST_LEDGER_FILE)
-        try:
-            with open(DUST_LEDGER_FILE, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=header)
-                if need_header:
-                    w.writeheader()
-                w.writerow(row)
-        except Exception as e:
-            print(f"[WARN] cannot write {DUST_LEDGER_FILE}: {e}")
-
-
-    def _avg_fill_price_from_order(self, order: dict, fallback_price: float) -> float:
-        """
-        พยายามอ่าน avg price จากโครงสร้าง ccxt:
-        - ถ้า order มี 'cost' และ 'filled' → ใช้ cost/filled
-        - ถ้าไม่มี ใช้ fallback_price (เช่น best_ask ตอนซื้อ) แทน
-        """
-        try:
-            filled = float(order.get("filled", 0.0) or 0.0)
-            cost   = float(order.get("cost",   0.0) or 0.0)
-            if filled > 0 and cost > 0:
-                return cost / filled
-            # บาง exchange แนบ 'trades' รายการย่อยมา → รวมเองได้ แต่ส่วนใหญ่ 'cost' ถูกต้องแล้ว
-        except Exception:
-            pass
-        return float(fallback_price or 0.0)
-
-
     def resync_open_orders(self, engine: "SignalEngine", grid_df: pd.DataFrame) -> None:
         try:
             oo = self.ex.fetch_open_orders(self.symbol)
@@ -753,49 +674,9 @@ class ExecutionLayer:
 
     # ---------- MARKET BUY (taker 100%) ----------
     def place_market_buy(self, level: float, desired_amount: float) -> Dict:
-        """
-        เหรียญแพง (ask >= HIGH_PRICE_THRESHOLD) → ซื้อแบบ quoteOrderQty = desired_amount * px_ref * QUOTE_SAFETY
-        เหรียญไม่แพง → ใช้วิธีเดิม (คำนวณ BASE จาก desired_amount แล้วตรวจ notional)
-        คืนค่า dict เดิม: {id, filled, avg, amt_sent, px_ref}
-        """
         _bid, ask = self._best_prices()
         px_ref = ask * (1.0 + max(0.0, SLIP_PCT)) if ask > 0 else level
 
-        if ask > 0 and ask >= HIGH_PRICE_THRESHOLD:
-            # ---- เหรียญแพง: ล็อกงบเป็น USDT ด้วย quoteOrderQty ----
-            quote_to_spend = max(0.0, desired_amount * px_ref * QUOTE_SAFETY)
-            quote_free = float(self._get_free_quote() or 0.0)
-            # ปัด 2 ทศนิยมสำหรับ USDT (safe default)
-            q = math.floor(quote_to_spend * 100) / 100.0
-
-            if (q <= 0) or (quote_free + 1e-9 < q) or (self.min_notional and q < self.min_notional):
-                print(f"[skip] insufficient quote for high-priced market buy level {level} "
-                      f"(quote_to_spend≈{quote_to_spend:.2f}, q≈{q:.2f}, quote_free≈{quote_free:.2f}, "
-                      f"minNotional={self.min_notional})")
-                return {"id": None, "filled": 0.0, "avg": None, "amt_sent": 0.0, "px_ref": px_ref}
-
-            if self.dry:
-                print(f"[DRY] MARKET BUY by quoteOrderQty={q} {self.symbol} (px_ref≈{px_ref:.8f})")
-                return {"id": f"dry-mkt-quote-{level}", "filled": 0.0, "avg": None, "amt_sent": 0.0, "px_ref": px_ref}
-
-            try:
-                o = self.ex.create_order(
-                    self.symbol, "market", "buy", None, None,
-                    {"quoteOrderQty": q, "newClientOrderId": self._cid("gbMq", px_ref), "newOrderRespType": "FULL"}
-                )
-                filled = float(o.get("filled") or 0.0)
-                # ใช้ cost/filled ถ้ามี เพื่อให้ avg แม่น
-                if filled > 0:
-                    cost = float(o.get("cost") or 0.0)
-                    avg = (cost / filled) if cost > 0 else float(o.get("average") or px_ref)
-                else:
-                    avg = None
-                return {"id": o.get("id"), "filled": filled, "avg": avg, "px_ref": px_ref, "amt_sent": 0.0}
-            except Exception as e:
-                print(f"[ERR] market buy (quoteOrderQty) failed: {e}")
-                return {"id": None, "filled": 0.0, "avg": None, "amt_sent": 0.0, "px_ref": px_ref}
-
-        # ---- เหรียญไม่แพง: วิธีเดิม (คำนวณ BASE แล้วตรวจ notional) ----
         need_amt = self.ensure_min_notional(px_ref, desired_amount)
         quote_free = self._get_free_quote()
         affordable_amt = self.round_amount_down(max(0.0, quote_free / max(px_ref, 1e-12)))
@@ -822,7 +703,6 @@ class ExecutionLayer:
         except Exception as e:
             print(f"[ERR] market buy failed: {e}")
             return {"id": None, "filled": 0.0, "avg": None, "amt_sent": 0.0, "px_ref": px_ref}
-
 
     # ---------- LIMIT SELL TP (Decimal: ราคา ceil, จำนวน floor) ----------
     def place_limit_sell_tp(self, level: float, amount: float, tp_price: float) -> Optional[str]:
@@ -896,27 +776,12 @@ class ExecutionLayer:
         - ปัดจำนวนลงตาม LOT_SIZE
         - ถ้า amt_floor*tp ยัง < minNotional → ยก tp ให้พ้น notional
         - บังคับ TP ≥ best_bid*(1+TP_BID_SAFETY_PCT)
-        - บันทึกเศษ (ส่วนต่างที่ขายไม่ได้) ลง dust_ledger.csv พร้อมต้นทุนเฉลี่ย
         """
         if self.dry:
             print(f"[DRY] place TP after market: tp_price={tp_price}")
             return f"dry-tp-{level}"
 
-        # ดึงคำสั่งซื้อจริง (เพื่อรู้ filled + cost → avg cost)
-        order_obj = None
-        filled_from_order = 0.0
-        try:
-            if market_order_id:
-                order_obj = self.ex.fetch_order(market_order_id, self.symbol)
-                filled_from_order = float(order_obj.get("filled") or 0.0)
-        except Exception:
-            # fallback: ใช้วิธีรอแบบเดิม
-            filled_from_order = self._wait_filled(market_order_id, 2.0) if market_order_id else 0.0
-
-        # best ask ไว้เป็น fallback สำหรับ avg cost
-        _best_bid, best_ask = self._best_prices()
-        avg_cost = self._avg_fill_price_from_order(order_obj or {}, fallback_price=best_ask or tp_price)
-
+        filled_from_order = self._wait_filled(market_order_id, 2.0) if market_order_id else 0.0
         time.sleep(0.25)  # ให้ balance sync
         free_base = self._get_free_base()
 
@@ -926,31 +791,10 @@ class ExecutionLayer:
 
         amt_floor = self.round_amount_down(cap)
 
-        # บันทึกเศษจากการปัด LOT_SIZE (ถ้ามี)
-        remainder = max(0.0, cap - amt_floor)
-        if remainder > 0:
-            self._append_dust_ledger(
-                remainder_qty=remainder,
-                unit_cost_usdt=avg_cost,
-                reason="lot_rounding",
-                ctx={"order_id": market_order_id, "planned_tp": tp_price,
-                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
-            )
-
-        # Gate: minQty
         if self.min_qty and amt_floor < self.min_qty:
-            # ทั้งก้อนเป็นเศษขายไม่ได้
-            self._append_dust_ledger(
-                remainder_qty=amt_floor,
-                unit_cost_usdt=avg_cost,
-                reason="minQty_gate",
-                ctx={"order_id": market_order_id, "planned_tp": tp_price,
-                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
-            )
             print(f"[skip] TP not placed (amt<{self.min_qty} minQty | free={free_base} | filled={filled_from_order})")
             return None
 
-        # ปรับราคา TP ให้พ้น minNotional ถ้าจำเป็น
         if (self.min_notional or 0.0) > 0 and amt_floor > 0:
             tp_need = (self.min_notional + 1e-12) / amt_floor
             tp_price = max(tp_price, tp_need)
@@ -961,33 +805,11 @@ class ExecutionLayer:
 
         sell_amt = self._safe_tp_amount(amt_floor, tp_price)
         if sell_amt <= 0:
-            # ตั้งขายไม่ได้ → บันทึกทั้งก้อนเป็นเศษ
-            self._append_dust_ledger(
-                remainder_qty=amt_floor,
-                unit_cost_usdt=avg_cost,
-                reason="minNotional_gate" if (self.min_notional and amt_floor * tp_price < self.min_notional) else "tp_not_placed",
-                ctx={"order_id": market_order_id, "planned_tp": tp_price,
-                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
-            )
             print(f"[skip] TP not placed (sell_amt={sell_amt} | free={free_base} | filled={filled_from_order} "
                   f"| minQty={self.min_qty} | minNotional={self.min_notional} | step={self.step_size})")
             return None
 
-        # วาง LIMIT SELL TP
-        try:
-            return self.place_limit_sell_tp(level, sell_amt, tp_price)
-        except Exception as e:
-            # วางไม่ผ่าน → บันทึกส่วนที่ตั้งใจจะขายเป็นเศษเพื่อให้ไปขายเอง
-            self._append_dust_ledger(
-                remainder_qty=sell_amt,
-                unit_cost_usdt=avg_cost,
-                reason="tp_place_failed",
-                ctx={"order_id": market_order_id, "planned_tp": tp_price,
-                     "step": self.step_size, "min_qty": self.min_qty, "min_notional": self.min_notional}
-            )
-            print(f"[ERR] place TP failed @ {tp_price}: {e}")
-            return None
-
+        return self.place_limit_sell_tp(level, sell_amt, tp_price)
 
     # ---------- pre-lock existing open orders ----------
     def prelock_existing(self, engine: "SignalEngine", grid_df: pd.DataFrame) -> None:
